@@ -1,15 +1,14 @@
 import os
-import yfinance as yf
-import pandas as pd
 import numpy as np
+import pandas as pd
+import yfinance as yf
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 
-data_dir = "C:\\Users\\Lovel\\VSCode\\LLFree_backtrace\\data"
-results_dir = "C:\\Users\\Lovel\\VSCode\\LLFree_backtrace\\results"
+main_dir = os.path.dirname(os.path.abspath(__file__))
+data_dir = os.path.join(main_dir, "data")
+results_dir = os.path.join(main_dir, "results")
 data_fpath = os.path.join(data_dir, "crypto_data.csv")
-results_file = os.path.join(results_dir, "backtest_results.csv")
-summary_file = os.path.join(results_dir, "performance_summary.csv")
 
 # Function to fetch and save data for multiple tickers
 def fetch_and_save_data(tickers, filename=data_fpath):
@@ -100,7 +99,7 @@ def backtest(ticker, filename=data_fpath):
                 shares = 0.0
                 in_position = False
             # Update portfolio value
-            df["strat_ret"].iloc[i] = cash + shares * df["Close"].iloc[i]
+            df.at[df.index[i], "strat_ret"] = cash + shares * df["Close"].iloc[i]
         return df
 
     def _calculate_lump_sum(df, initial_capital=1000.0):
@@ -187,11 +186,14 @@ def backtest(ticker, filename=data_fpath):
     initial_capital = 1000.0
     df = _simulate_strategy(df, initial_capital)
     df = _calculate_lump_sum(df, initial_capital)
+
     # Output results
+    results_file = os.path.join(results_dir, f"{ticker}_backtest_results.csv")
     df.to_csv(results_file, index=True)
 
     # Calculate performance metrics
     results = _calculate_performance_metrics(df)
+    summary_file = os.path.join(results_dir, f"{ticker}_performance_summary.csv")
     results.to_csv(summary_file, index=False)
     print(f"Backtesting results saved to {results_file}")
 

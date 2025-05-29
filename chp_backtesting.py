@@ -5,6 +5,7 @@ import yfinance as yf
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 import mplfinance as mpf
+import matplotlib.dates as mdates
 
 main_dir = os.path.dirname(os.path.abspath(__file__))
 data_dir = os.path.join(main_dir, "data")
@@ -79,9 +80,12 @@ def get_indicators(ticker, df):
 
     # Generate signals: +1 long, 0 flat
     diff = df["EMA_fast"] - df["EMA_slow"]
+    rel_diff = np.abs(diff) / df["EMA_slow"]
+    threshold = 0.01  # 10% threshold for relative difference
     df["signal"] = 0
-    df.loc[diff > atr_mult * df["ATR"], "signal"] = 1
-    df.loc[diff < -atr_mult * df["ATR"], "signal"] = 0  # flat on bearish
+    # Signal only if ATR threshold and relative difference > 10%
+    df.loc[(diff > atr_mult * df["ATR"]) & (rel_diff > threshold), "signal"] = 1
+    df.loc[(diff < -atr_mult * df["ATR"]) | (rel_diff <= threshold), "signal"] = 0  # flat on bearish or not enough separation
     # Shift signal into a position (enter next bar - next day after signal)
     df["long"] = df["signal"].shift(1).fillna(0)
 
@@ -210,92 +214,152 @@ def backtest(ticker, df):
     results.to_csv(summary_file, index=False)
     print(f"Backtesting results saved to {results_file}")
 
-def ploter(ticker, df, date_range=None):
+class Ploter:
+    def __init__(self, ticker, df, date_range=None):
+        self.ticker = ticker
+        self.df = df
+        self.date_range = date_range
 
-    if False:
-        df = pd.read_csv(results_file, parse_dates=["Date"], index_col="Date")
-        ticker = [col.split('_')[0] for col in df.columns if col.endswith("Close")][0]
-        close_col = f"{ticker}_Close" if f"{ticker}_Close" in df.columns else "Close"
-        if "EMA_fast" not in df.columns or "EMA_slow" not in df.columns:
-            print("MACD lines not found in results file. Please run backtest first.")
-            return
+        # If date_range is provided, filter the DataFrame
+        if date_range is not None:
+            start_date = pd.to_datetime(date_range[0], format='%Y-%m-%d')
+            end_date = pd.to_datetime(date_range[1], format='%Y-%m-%d')
+            self.df = self.df.loc[(self.df.index >= start_date) & (self.df.index <= end_date)].copy()
+
+        self.color_dict = {
+            'dark_gold': '#CFAC2D',
+            'light_gold': '#FDFE7A',
+            'dark_blue': "#311CE8",
+            'light_blue': '#D1CAF4',
+            'gray': '#8F8F8E'
+        }
+    
+    def plot_plt(self):
+        """ Plotting with matplotlib """
 
         plt.figure(figsize=(14, 7))
-        plt.plot(df.index, df[close_col], label="Close Price", color="black")
-        plt.plot(df.index, df["EMA_fast"], label="EMA Fast (MACD)", color="blue", linestyle="--")
-        plt.plot(df.index, df["EMA_slow"], label="EMA Slow (MACD)", color="red", linestyle="--")
-        plt.title(f"{ticker} Close Price and MACD Lines")
+        plt.plot(self.df.index, self.df["Close"], label="Close Price", color="black")
+
+        # Value-based coloring for EMA_fast and EMA_slow
+        ema_fast = self.df["EMA_fast"]
+        ema_slow = self.df["EMA_slow"]
+        above = ema_fast > ema_slow
+        below = ~above
+        # Plot EMA_fast and EMA_slow with value-based coloring, 
+        # avoiding lines across missing dates
+        def plot_segments(x, y, mask, color, label=None):
+            # Plot only contiguous segments where mask is True
+            idx = np.where(mask)[0]
+            if len(idx) == 0:
+                return
+            # Find breaks in the mask
+            splits = np.where(np.diff(idx) > 1)[0] + 1
+            segments = np.split(idx, splits)
+            for i, seg in enumerate(segments):
+                if len(seg) > 1:
+                    seg_label = label if i == 0 else None
+                    plt.plot(x[seg], y[seg], color=color, linestyle="-", label=seg_label)
+
+        x = mdates.date2num(self.df.index.to_pydatetime())
+        plot_segments(x, ema_fast.values, above.values, self.color_dict['dark_gold'], label="EMA Fast (Above)")
+        plot_segments(x, ema_fast.values, below.values, self.color_dict['dark_blue'], label="EMA Fast (Below)")
+        plot_segments(x, ema_slow.values, above.values, self.color_dict['dark_gold'], label="EMA Slow (Above)")
+        plot_segments(x, ema_slow.values, below.values, self.color_dict['dark_blue'], label="EMA Slow (Below)")
+
+        # Fill the space between EMA_fast and EMA_slow, but only for contiguous segments
+        def fill_between_segments(x, y1, y2, mask, color, label):
+            idx = np.where(mask)[0]
+            if len(idx) == 0:
+                return
+            splits = np.where(np.diff(idx) > 1)[0] + 1
+            segments = np.split(idx, splits)
+            for i, seg in enumerate(segments):
+                if len(seg) > 1:
+                    seg_label = label if i == 0 else None
+                    plt.fill_between(
+                    x[seg],
+                    y1[seg],
+                    y2[seg],
+                    color=color,
+                    alpha=0.4,
+                    interpolate=True,
+                    label=seg_label
+                    )
+
+        fill_between_segments(x, ema_fast.values, ema_slow.values, above.values, self.color_dict['light_gold'], "EMA Fast > EMA Slow")
+        fill_between_segments(x, ema_fast.values, ema_slow.values, below.values, self.color_dict['light_blue'], "EMA Fast < EMA Slow")
+        # Plot SMAs
+        # if "SMA_50" in self.df.columns:
+        #     plt.plot(self.df.index, self.df["SMA_50"], label="SMA 50", color="green", linestyle="-")
+
+        # Plot buy (green up arrow) and sell (red down arrow) signals
+        if "long" in self.df.columns:
+            buy_signals = self.df[(self.df["long"].diff() == 1)]
+            sell_signals = self.df[(self.df["long"].diff() == -1)]
+            plt.scatter(buy_signals.index, buy_signals["Close"], 
+                        marker="^", color="green", s=100, label="Buy Signal")
+            plt.scatter(sell_signals.index, sell_signals["Close"], 
+                        marker="v", color="red", s=100, label="Sell Signal")
+
+        plt.title(f"{self.ticker} Price and MACD Lines")
         plt.xlabel("Date")
         plt.ylabel("Price")
         plt.legend()
         plt.tight_layout()
         plt.show()
 
-    # Plotting with mplfinance
-    # Prepare DataFrame for mplfinance: columns must be ['Open', 'High', 'Low', 'Close']
-    ohlc_cols = ["Open", "High", "Low", "Close"]
-    if not all(col in df.columns for col in ohlc_cols):
-        print("DataFrame does not contain required OHLC columns for mplfinance.")
-        return
-    
-    # If date_range is provided, filter the DataFrame
-    if date_range is not None:
-        # Ensure date_range is in 'YYYY-MM-DD' format
-        start_date = pd.to_datetime(date_range[0], format='%Y-%m-%d')
-        end_date = pd.to_datetime(date_range[1], format='%Y-%m-%d')
-        df_plot = df.loc[(df.index >= start_date) & (df.index <= end_date)].copy()
-    else:
-        df_plot = df
+    def plot_mpl(self):
+        """ Plotting with mplfinance """
 
-    # Now use df_plot for all subsequent plotting logic
-    # Optionally add indicators to the plot (e.g., EMA_fast, EMA_slow, SMA_50)
-    color_dict = {
-        'golden': '#CFAC2D',
-        'light_gold': '#FDFE7A',
-        'dark_blue': "#311CE8",
-        'light_blue': '#D1CAF4',
-        'gray': '#8F8F8E'
-    }
-    addplots = []
-    if True:
-        if "EMA_fast" in df_plot.columns:
-            addplots.append(mpf.make_addplot(df_plot["EMA_fast"], color=color_dict['golden'], width=1.0, linestyle='--', label='EMA Fast'))
-        if "EMA_slow" in df_plot.columns:
-            addplots.append(mpf.make_addplot(df_plot["EMA_slow"], color=color_dict['dark_blue'], width=1.0, linestyle='--', label='EMA Slow'))
-    if False: 
-        if "SMA_50" in df_plot.columns:
-            addplots.append(mpf.make_addplot(df_plot["SMA_50"], color='green', width=1.0, linestyle='-', label='SMA 50'))
-        if "SMA_100" in df_plot.columns:
-            addplots.append(mpf.make_addplot(df_plot["SMA_100"], color='orange', width=1.0, linestyle='-', label='SMA 100'))
-        if "SMA_150" in df_plot.columns:
-            addplots.append(mpf.make_addplot(df_plot["SMA_150"], color='purple', width=1.0, linestyle='-', label='SMA 150'))
+        df = self.df
+        ticker = self.ticker
 
-    # Plot buy/sell signals as markers
-    signal_markers = []
-    if False:
-        buy_signals = df_plot[(df_plot["long"].diff() == 1)]
-        sell_signals = df_plot[(df_plot["long"].diff() == -1)]
-        if not buy_signals.empty:
-            signal_markers.append(mpf.make_addplot(buy_signals["Close"], type='scatter', markersize=100, marker='^', color='lime', label='Buy'))
-        if not sell_signals.empty:
-            signal_markers.append(mpf.make_addplot(sell_signals["Close"], type='scatter', markersize=100, marker='v', color='red', label='Sell'))
+        # Prepare DataFrame for mplfinance: columns must be ['Open', 'High', 'Low', 'Close']
+        ohlc_cols = ["Open", "High", "Low", "Close"]
+        if not all(col in df.columns for col in ohlc_cols):
+            print("DataFrame does not contain required OHLC columns for mplfinance.")
+            return
 
-    # Combine all addplots
-    all_addplots = addplots + signal_markers
+        # Optionally add indicators to the plot (e.g., EMA_fast, EMA_slow, SMA_50)
+        addplots = []
+        if "EMA_fast" in df.columns:
+            addplots.append(mpf.make_addplot(df["EMA_fast"], color=self.color_dict['dark_gold'], width=1.0, linestyle='--', label='EMA Fast'))
+        if "EMA_slow" in df.columns:
+            addplots.append(mpf.make_addplot(df["EMA_slow"], color=self.color_dict['dark_blue'], width=1.0, linestyle='--', label='EMA Slow'))
+        # Optionally add SMAs (disabled by default)
+        if False:
+            if "SMA_50" in df.columns:
+                addplots.append(mpf.make_addplot(df["SMA_50"], color='green', width=1.0, linestyle='-', label='SMA 50'))
+            if "SMA_100" in df.columns:
+                addplots.append(mpf.make_addplot(df["SMA_100"], color='orange', width=1.0, linestyle='-', label='SMA 100'))
+            if "SMA_150" in df.columns:
+                addplots.append(mpf.make_addplot(df["SMA_150"], color='purple', width=1.0, linestyle='-', label='SMA 150'))
 
-    mpf.plot(
-        df_plot,
-        type='candle',
-        style='charles',
-        title=f"{ticker} Price Chart with Indicators and Signals",
-        ylabel='Price',
-        volume=False,
-        addplot=all_addplots,
-        figratio=(16, 9),
-        figscale=1.2,
-        tight_layout=True,
-        datetime_format='%Y-%m'
-    )
+        # Plot buy/sell signals as markers (disabled by default)
+        signal_markers = []
+        if False:
+            buy_signals = df[(df["long"].diff() == 1)]
+            sell_signals = df[(df["long"].diff() == -1)]
+            if not buy_signals.empty:
+                signal_markers.append(mpf.make_addplot(buy_signals["Close"], type='scatter', markersize=100, marker='^', color='lime', label='Buy'))
+            if not sell_signals.empty:
+                signal_markers.append(mpf.make_addplot(sell_signals["Close"], type='scatter', markersize=100, marker='v', color='red', label='Sell'))
+
+        all_addplots = addplots + signal_markers
+
+        mpf.plot(
+            df,
+            type='candle',
+            style='charles',
+            title=f"{ticker} Price Chart with Indicators and Signals",
+            ylabel='Price',
+            volume=False,
+            addplot=all_addplots,
+            figratio=(16, 9),
+            figscale=1.2,
+            tight_layout=True,
+            datetime_format='%Y-%m'
+        )
 
 if __name__ == "__main__":
     if False: # Fetch and save data for multiple tickers
@@ -307,7 +371,7 @@ if __name__ == "__main__":
     # Check if indicators file exists
     data_ind_fpath = os.path.join(data_dir, f"{ticker}_data_indicators.csv")
     if os.path.exists(data_ind_fpath):
-        print(f"Indicators for {ticker} already exist at {data_ind_fpath}. Loading existing data.")
+        print(f"Indicators for {ticker} already exist. Loading existing data.")
         df = pd.read_csv(data_ind_fpath, parse_dates=["Date"], index_col="Date")
     else:
         # Load ticker data
@@ -318,5 +382,6 @@ if __name__ == "__main__":
     if False:
         backtest(ticker, df)
     if True:
-        date_range = ("2023-01-01", "2023-12-31")
-        ploter(ticker, df, date_range=date_range)
+        date_range = ("2024-05-01", "2024-11-30")
+        ploter = Ploter(ticker, df, date_range=date_range)
+        ploter.plot_plt()

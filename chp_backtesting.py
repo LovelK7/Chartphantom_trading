@@ -14,6 +14,14 @@ data_fpath = os.path.join(data_dir, "crypto_data.csv")
 
 # Function to fetch and save data for multiple tickers
 def fetch_and_save_data(tickers, filename=data_fpath):
+    """
+    Fetch historical data for multiple tickers and save to a CSV file.
+    tickers: List of ticker symbols to fetch data for.
+    filename: Path to the CSV file where data will be saved.
+    """
+    print(f"Fetching data for tickers: {', '.join(tickers)}")
+    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(results_dir, exist_ok=True)
     try:
         existing_data = pd.read_csv(filename, parse_dates=["Date"], index_col="Date")
         existing_tickers = list({col.split('_')[0] for col in existing_data.columns if '_' in col})
@@ -56,45 +64,57 @@ def load_ticker_data(ticker, filename):
     return df
 
 def get_indicators(ticker, df):
-    # Calculate 50, 100 and 150-day SMA
-    df["SMA_50"] = df["Close"].rolling(window=50).mean()
-    df["SMA_100"] = df["Close"].rolling(window=100).mean()
-    df["SMA_150"] = df["Close"].rolling(window=150).mean()
+    # Pine parameters
+    fast_len, slow_len, atr_len, atr_mult = 30, 60, 60, 0.30
 
-    # Define MACD params
-    fast_len=30 
-    slow_len=60
-    atr_len=60
-    atr_mult=0.30
-    # Calculate Exponential Moving Averages (EMA)
+    # Calculate EMAs
     df["EMA_fast"] = df["Close"].ewm(span=fast_len, adjust=False).mean()
     df["EMA_slow"] = df["Close"].ewm(span=slow_len, adjust=False).mean()
+    df["EMA_diff"] = df["EMA_fast"] - df["EMA_slow"]
 
-    # True range and ATR (Average True Range) calculation
-    df["H-L"] = df["Close"].shift(1).bfill() - df["Close"]
-    df["TR"] = np.maximum.reduce([
-        df["Close"] - df["Close"].shift(1).abs(),
-        df["Close"].shift(1) - df["Close"]
-    ])
-    df["ATR"] = df["TR"].rolling(window=atr_len).mean()
+    # Calculate ATR (PineScript style)
+    prev_close = df["Close"].shift(1)
+    tr = pd.DataFrame({
+        "tr1": df["High"] - df["Low"],
+        "tr2": (df["High"] - prev_close).abs(),
+        "tr3": (df["Low"] - prev_close).abs()
+    }).max(axis=1)
+    df["ATR"] = tr.rolling(window=atr_len).mean()
 
-    # Generate signals: +1 long, 0 flat
-    diff = df["EMA_fast"] - df["EMA_slow"]
-    rel_diff = np.abs(diff) / df["EMA_slow"]
-    threshold = 0.01  # 10% threshold for relative difference
-    df["signal"] = 0
-    # Signal only if ATR threshold and relative difference > 10%
-    df.loc[(diff > atr_mult * df["ATR"]) & (rel_diff > threshold), "signal"] = 1
-    df.loc[(diff < -atr_mult * df["ATR"]) | (rel_diff <= threshold), "signal"] = 0  # flat on bearish or not enough separation
-    # Shift signal into a position (enter next bar - next day after signal)
-    df["long"] = df["signal"].shift(1).fillna(0)
+    # Trend conditions for coloring
+    atr_margin = atr_mult * df["ATR"]
+    df["bull"] = df["EMA_diff"] >  atr_margin
+    df["bear"] = df["EMA_diff"] < -atr_margin
+    df["neutral"] = ~(df["bull"] | df["bear"])
+    df["ema_color"] = np.where(df["bull"], "bull", np.where(df["bear"], "bear", "neutral"))
 
-    # Save the new df with indicators
-    df = df.drop(columns=["H-L", "TR"])  # Drop intermediate columns
-
-    # Save the DataFrame with indicators
+    # Save if needed
+    data_ind_fpath = os.path.join(data_dir, f"{ticker}_data_indicators.csv")
     df.to_csv(data_ind_fpath)
     print(f"Indicators for {ticker} saved to {data_ind_fpath}")
+    return df
+
+def get_signals(df):
+    df["long"] = 0
+    df["signal"] = 0
+
+    # Buy signal: when bull turns True (from not bull)
+    buy_signal = (df["bull"] & ~df["bull"].shift(1).astype(bool).fillna(False))
+    # Sell signal: when bear turns True (from not bear)
+    sell_signal = (df["bear"] & ~df["bear"].shift(1).astype(bool).fillna(False))
+
+    df.loc[buy_signal, "signal"] = 1   # Buy
+    df.loc[sell_signal, "signal"] = -1 # Sell
+
+    # Forward fill long position: in position after buy, out after sell
+    in_position = False
+    for i in range(len(df)):
+        if df["signal"].iloc[i] == 1:
+            in_position = True
+        elif df["signal"].iloc[i] == -1:
+            in_position = False
+        df.at[df.index[i], "long"] = int(in_position)
+
     return df
 
 
@@ -231,77 +251,102 @@ class Ploter:
             'light_gold': '#FDFE7A',
             'dark_blue': "#311CE8",
             'light_blue': '#D1CAF4',
-            'gray': '#8F8F8E'
+            'dark_gray': '#4F4F4E',
+            'light_gray': '#D9D9D8',
         }
     
     def plot_plt(self):
-        """ Plotting with matplotlib """
+        """ Plotting with matplotlib using ema_color for segment coloring """
 
         plt.figure(figsize=(14, 7))
         plt.plot(self.df.index, self.df["Close"], label="Close Price", color="black")
 
-        # Value-based coloring for EMA_fast and EMA_slow
         ema_fast = self.df["EMA_fast"]
         ema_slow = self.df["EMA_slow"]
-        above = ema_fast > ema_slow
-        below = ~above
-        # Plot EMA_fast and EMA_slow with value-based coloring, 
-        # avoiding lines across missing dates
-        def plot_segments(x, y, mask, color, label=None):
-            # Plot only contiguous segments where mask is True
-            idx = np.where(mask)[0]
-            if len(idx) == 0:
-                return
-            # Find breaks in the mask
-            splits = np.where(np.diff(idx) > 1)[0] + 1
-            segments = np.split(idx, splits)
-            for i, seg in enumerate(segments):
-                if len(seg) > 1:
-                    seg_label = label if i == 0 else None
-                    plt.plot(x[seg], y[seg], color=color, linestyle="-", label=seg_label)
-
+        ema_color = self.df["ema_color"]
         x = mdates.date2num(self.df.index.to_pydatetime())
-        plot_segments(x, ema_fast.values, above.values, self.color_dict['dark_gold'], label="EMA Fast (Above)")
-        plot_segments(x, ema_fast.values, below.values, self.color_dict['dark_blue'], label="EMA Fast (Below)")
-        plot_segments(x, ema_slow.values, above.values, self.color_dict['dark_gold'], label="EMA Slow (Above)")
-        plot_segments(x, ema_slow.values, below.values, self.color_dict['dark_blue'], label="EMA Slow (Below)")
 
-        # Fill the space between EMA_fast and EMA_slow, but only for contiguous segments
-        def fill_between_segments(x, y1, y2, mask, color, label):
-            idx = np.where(mask)[0]
-            if len(idx) == 0:
-                return
-            splits = np.where(np.diff(idx) > 1)[0] + 1
-            segments = np.split(idx, splits)
-            for i, seg in enumerate(segments):
-                if len(seg) > 1:
-                    seg_label = label if i == 0 else None
-                    plt.fill_between(
-                    x[seg],
-                    y1[seg],
-                    y2[seg],
-                    color=color,
-                    alpha=0.4,
-                    interpolate=True,
-                    label=seg_label
-                    )
+        # Map ema_color to color_dict
+        color_map = {
+            "bull": self.color_dict['dark_gold'],
+            "bear": self.color_dict['dark_blue'],
+            "neutral": self.color_dict['dark_gray'],
+        }
+        fill_color_map = {
+            "bull": self.color_dict['light_gold'],
+            "bear": self.color_dict['light_blue'],
+            "neutral": self.color_dict['light_gray'],
+        }
 
-        fill_between_segments(x, ema_fast.values, ema_slow.values, above.values, self.color_dict['light_gold'], "EMA Fast > EMA Slow")
-        fill_between_segments(x, ema_fast.values, ema_slow.values, below.values, self.color_dict['light_blue'], "EMA Fast < EMA Slow")
-        # Plot SMAs
-        # if "SMA_50" in self.df.columns:
-        #     plt.plot(self.df.index, self.df["SMA_50"], label="SMA 50", color="green", linestyle="-")
 
-        # Plot buy (green up arrow) and sell (red down arrow) signals
-        if "long" in self.df.columns:
-            buy_signals = self.df[(self.df["long"].diff() == 1)]
-            sell_signals = self.df[(self.df["long"].diff() == -1)]
-            plt.scatter(buy_signals.index, buy_signals["Close"], 
-                        marker="^", color="green", s=100, label="Buy Signal")
-            plt.scatter(sell_signals.index, sell_signals["Close"], 
-                        marker="v", color="red", s=100, label="Sell Signal")
+        # Plot EMA_fast and EMA_slow with coloring by ema_color
+        def _plot_colored_segments(x, y, color_series, label_prefix):
+            prev_color = None
+            seg_start = 0
+            for i in range(1, len(y)):
+                color = color_series.iloc[i]
+                if color != prev_color or i == len(y) - 1:
+                    if prev_color is not None:
+                        seg_end = i if color != prev_color else i + 1
+                        plt.plot(
+                            x[seg_start:seg_end],
+                            y[seg_start:seg_end],
+                            color=color_map[prev_color],
+                            linewidth=2,
+                            label=f"{label_prefix} ({prev_color})" if seg_start == 0 else None
+                        )
+                    seg_start = i - 1
+                    prev_color = color
+        _plot_colored_segments(x, ema_fast.values, ema_color, "EMA Fast")
+        _plot_colored_segments(x, ema_slow.values, ema_color, "EMA Slow")
 
-        plt.title(f"{self.ticker} Price and MACD Lines")
+        # Fill between EMA_fast and EMA_slow with colors based on ema_color
+        def _fill_between_emas(x, ema_fast, ema_slow, ema_color, fill_color_map):
+            prev_color = None
+            seg_start = 0
+            for i in range(1, len(ema_fast)):
+                color = ema_color.iloc[i]
+                if color != prev_color or i == len(ema_fast) - 1:
+                    if prev_color is not None:
+                        seg_end = i if color != prev_color else i + 1
+                        plt.fill_between(
+                            x[seg_start:seg_end],
+                            ema_fast[seg_start:seg_end],
+                            ema_slow[seg_start:seg_end],
+                            color=fill_color_map[prev_color],
+                            alpha=0.4,
+                            interpolate=True,
+                            label=f"Fill ({prev_color})" if seg_start == 0 else None
+                        )
+                    seg_start = i - 1
+                    prev_color = color
+        _fill_between_emas(x, ema_fast.values, ema_slow.values, ema_color, fill_color_map)
+        
+        # Plot signals
+        def _plot_signals():
+            # Plot buy (green up) and sell (red down) arrows for signals
+            buy_signals = self.df[self.df["signal"] == 1]
+            sell_signals = self.df[self.df["signal"] == -1]
+
+            plt.scatter(
+                    mdates.date2num(buy_signals.index),
+                    buy_signals["Close"],
+                    marker="^",
+                    color="green",
+                    s=100,
+                    label="Buy Signal"
+                )
+            plt.scatter(
+                    mdates.date2num(sell_signals.index),
+                    sell_signals["Close"],
+                    marker="v",
+                    color="red",
+                    s=100,
+                    label="Sell Signal"
+                )
+        _plot_signals()
+
+        plt.title(f"{self.ticker} Price and EMA Trend Coloring")
         plt.xlabel("Date")
         plt.ylabel("Price")
         plt.legend()
@@ -366,22 +411,26 @@ if __name__ == "__main__":
         tickers = ["BTC-USD", "SOL-USD", "SUI-USD"]
         fetch_and_save_data(tickers)
 
-    ticker = "BTC-USD"
+    if True: # Backtest and plot for a specific ticker
+        ticker = "BTC-USD"
 
-    # Check if indicators file exists
-    data_ind_fpath = os.path.join(data_dir, f"{ticker}_data_indicators.csv")
-    if os.path.exists(data_ind_fpath):
-        print(f"Indicators for {ticker} already exist. Loading existing data.")
-        df = pd.read_csv(data_ind_fpath, parse_dates=["Date"], index_col="Date")
-    else:
-        # Load ticker data
-        df = load_ticker_data(ticker, data_fpath)
-        # Compute indicator values
-        df = get_indicators(ticker, df)
+        # Check if indicators file exists
+        data_ind_fpath = os.path.join(data_dir, f"{ticker}_data_indicators.csv")
+        overwrite = True
+        if not overwrite and os.path.exists(data_ind_fpath):
+            print(f"Indicators for {ticker} already exist. Loading existing data.")
+            df = pd.read_csv(data_ind_fpath, parse_dates=["Date"], index_col="Date")
+        else:
+            # Load ticker data
+            df = load_ticker_data(ticker, data_fpath)
+            # Compute indicator values
+            df = get_indicators(ticker, df)
+            # Get trading signals
+            df = get_signals(df)
 
-    if False:
-        backtest(ticker, df)
-    if True:
-        date_range = ("2024-05-01", "2024-11-30")
-        ploter = Ploter(ticker, df, date_range=date_range)
-        ploter.plot_plt()
+        if False:
+            backtest(ticker, df)
+        if True:
+            date_range = ("2024-01-01", "2025-01-01")
+            ploter = Ploter(ticker, df, date_range=date_range)
+            ploter.plot_plt()

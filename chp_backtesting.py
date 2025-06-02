@@ -11,6 +11,7 @@ main_dir = os.path.dirname(os.path.abspath(__file__))
 data_dir = os.path.join(main_dir, "data")
 results_dir = os.path.join(main_dir, "results")
 data_fpath = os.path.join(data_dir, "crypto_data.csv")
+strategies_fpath = os.path.join(results_dir, "!strategies_performance_summary.csv")
 
 # Function to fetch and save data for multiple tickers
 def fetch_and_save_data(tickers, filename=data_fpath):
@@ -63,9 +64,22 @@ def load_ticker_data(ticker, filename):
         return None
     return df
 
-def get_indicators(ticker, df, result_csv=None):
+def get_default_indicators(ticker, df, result_csv=None):
     # Pine parameters
     fast_len, slow_len, atr_len, atr_mult = 30, 60, 60, 0.30
+
+    # Only compute if columns do not already exist
+    needed_cols = ["EMA_fast", "EMA_slow", "EMA_diff", 
+                   "SMA_50", "SMA_100", "SMA_150", 
+                   "ATR", "bull", "bear", "neutral", "ema_color"]
+    if all(col in df.columns for col in needed_cols):
+        print(f"-- Indicators for {ticker} already exist in DataFrame. Skipping calculation.")
+        return df
+    
+    # Calculate SMAs
+    df["SMA_50"] = df["Close"].rolling(window=50).mean()
+    df["SMA_100"] = df["Close"].rolling(window=100).mean()
+    df["SMA_150"] = df["Close"].rolling(window=150).mean()
 
     # Calculate EMAs
     df["EMA_fast"] = df["Close"].ewm(span=fast_len, adjust=False).mean()
@@ -91,54 +105,83 @@ def get_indicators(ticker, df, result_csv=None):
     # Save
     if result_csv:
         df.to_csv(result_csv, index=True)
-        print(f"Indicators for {ticker} saved to {result_csv}")
+        print(f"--- Indicators for {ticker} saved.")
     return df
 
-def get_signals(ticker, df, result_csv=None):
-    df["long"] = 0
-    df["signal"] = 0
+def get_default_signals(ticker, df, result_csv=None):
+    # Skip if columns that start with "str_def" already exist
+    if any(col.startswith("str_def") for col in df.columns):
+        print(f"-- Signals for {ticker} already exist in DataFrame. Skipping calculation.")
+        return df
+
+    df["str_def_long"] = 0
+    df["str_def_signal"] = 0
 
     # Buy signal: when bull turns True (from not bull)
     buy_signal = (df["bull"] & ~df["bull"].shift(1).astype(bool).fillna(False))
     # Sell signal: when bear turns True (from not bear)
     sell_signal = (df["bear"] & ~df["bear"].shift(1).astype(bool).fillna(False))
 
-    df.loc[buy_signal, "signal"] = 1   # Buy
-    df.loc[sell_signal, "signal"] = -1 # Sell
+    df.loc[buy_signal, "str_def_signal"] = 1   # Buy
+    df.loc[sell_signal, "str_def_signal"] = -1 # Sell
 
     # Forward fill long position: in position after buy, out after sell
     in_position = False
     for i in range(len(df)):
-        if df["signal"].iloc[i] == 1:
+        if df["str_def_signal"].iloc[i] == 1:
             in_position = True
-        elif df["signal"].iloc[i] == -1:
+        elif df["str_def_signal"].iloc[i] == -1:
             in_position = False
-        df.at[df.index[i], "long"] = int(in_position)
+        df.at[df.index[i], "str_def_long"] = int(in_position)
     
     # Save if needed
     if result_csv:
         df.to_csv(result_csv, index=True)
-        print(f"Signals for {ticker} saved to {result_csv}")
+        print(f"--- Signals for {ticker} saved to.")
     return df
 
 
-def get_backtest(ticker, df, result_csv=None):
-    """
-    Perform a backtest for a specific ticker using the preprocessed data.
-    """
-    def _simulate_strategy(df, initial_capital=1000.0):
-        """
-        Simulate strategy: allocate initial capital at first Buy signal (signal == 1),
-        sell at next Sell signal (signal == -1). Ignore extra Buys if already allocated,
-        and ignore Sells if not allocated.
-        """
-        df["strat_ret"] = initial_capital
+class Backtest():
+    def __init__(self, ticker, df, results_csv=None):
+        self.ticker = ticker
+        self.df = df
+        self.results_csv = results_csv
+        self.summary = None
+
+    def _simulate_lump_sum(self):
+        df = self.df
+        initial_capital = self.initial_capital
+        # Lump sum buy-and-hold: buy at first long==1, sell at last long==0 after being in position
+        df["str_lump_sum"] = initial_capital
+        long_diff = df["str_def_long"].diff().fillna(0)
+        first_buy_idx = df.index[long_diff == 1]
+        last_sell_idx = df.index[long_diff == -1]
+        if not first_buy_idx.empty and not last_sell_idx.empty:
+            buy_idx = first_buy_idx[0]
+            sell_idx = last_sell_idx[-1]
+            buy_price = df.at[buy_idx, "Close"]
+            sell_price = df.at[sell_idx, "Close"]
+            shares_lump = initial_capital / buy_price
+            for idx in df.index:
+                if idx < buy_idx:
+                    df.at[idx, "str_lump_sum"] = initial_capital
+                elif buy_idx <= idx <= sell_idx:
+                    df.at[idx, "str_lump_sum"] = shares_lump * df.at[idx, "Close"]
+                else:
+                    df.at[idx, "str_lump_sum"] = shares_lump * sell_price
+        self.df = df
+
+    def _simulate_strategy(self):
+        df = self.df
+        str_prefix = self.str_prefix
+        initial_capital = self.initial_capital
+        df[f"{str_prefix}_ret"] = initial_capital
         allocated = False
         cash = initial_capital
         shares = 0.0
 
         for i in range(1, len(df)):
-            signal = df["signal"].iloc[i]
+            signal = df[f"{str_prefix}_signal"].iloc[i]
             price = df["Close"].iloc[i]
             if signal == 1 and not allocated:
                 # Allocate capital at Buy
@@ -151,119 +194,115 @@ def get_backtest(ticker, df, result_csv=None):
                 shares = 0.0
                 allocated = False
             # Update portfolio value
-            df.at[df.index[i], "strat_ret"] = cash + shares * price
-        return df
+            df.at[df.index[i], f"{str_prefix}_ret"] = cash + shares * price
+        self.df = df
 
-    def _calculate_lump_sum(df, initial_capital=1000.0):
-        # Lump sum buy-and-hold: buy at first long==1, sell at last long==0 after being in position
-        df["strat_lump_sum"] = initial_capital
-        long_diff = df["long"].diff().fillna(0)
-        first_buy_idx = df.index[long_diff == 1]
-        last_sell_idx = df.index[long_diff == -1]
-        if not first_buy_idx.empty and not last_sell_idx.empty:
-            buy_idx = first_buy_idx[0]
-            sell_idx = last_sell_idx[-1]
-            buy_price = df.at[buy_idx, "Close"]
-            sell_price = df.at[sell_idx, "Close"]
-            shares_lump = initial_capital / buy_price
-            for idx in df.index:
-                if idx < buy_idx:
-                    df.at[idx, "strat_lump_sum"] = initial_capital
-                elif buy_idx <= idx <= sell_idx:
-                    df.at[idx, "strat_lump_sum"] = shares_lump * df.at[idx, "Close"]
-                else:
-                    df.at[idx, "strat_lump_sum"] = shares_lump * sell_price
-        return df
 
-    def _calculate_performance_metrics(df, strategy_col="strat_ret"):
-        """
-        Compute performance metrics for a given strategy column (e.g., 'strat_ret', 'strat_lump_sum').
-        Assumes strategy_col is updated daily and reflects portfolio value.
-        """
-        if strategy_col not in df.columns:
-            raise ValueError(f"Column {strategy_col} not found in DataFrame.")
-
-        # Use the strategy portfolio values as-is (already updated daily)
-        portfolio = df[strategy_col].copy().ffill()
-
-        total_return = portfolio.iloc[-1] / portfolio.iloc[0] - 1
-        daily_returns = portfolio.pct_change().fillna(0)
-
-        # Calculate CAGR
+    def _calculate_lump_sum_metrics(self):
+        df = self.df
+        lump_portfolio = df["str_lump_sum"].copy().ffill()
+        total_return = lump_portfolio.iloc[-1] / lump_portfolio.iloc[0] - 1
         days = (df.index[-1] - df.index[0]).days
         years = days / 365.25 if days > 0 else np.nan
-        cagr = (portfolio.iloc[-1] / portfolio.iloc[0]) ** (1 / years) - 1 if years > 0 else np.nan
+        cagr = (lump_portfolio.iloc[-1] / lump_portfolio.iloc[0]) ** (1 / years) - 1 if years > 0 else np.nan
+        self.lump_sum_metrics = {
+            "Lump Sum ROI": total_return,
+            "Lump Sum ROI %": f"{total_return * 100:.2f}%",
+            "Lump Sum CAGR": cagr,
+            "Lump Sum CAGR %": f"{cagr * 100:.2f}%" if years == years else "N/A",
+            "Backtest Period": f"{df.index[0].date()} to {df.index[-1].date()} ({years:.1f} years)" if years == years else "N/A"
+        }
 
-        # Calculate win rate and number of trades (if possible)
-        trades = []
-        entry_price = None
-        if "long" in df.columns and "Close" in df.columns:
-            for i in range(1, len(df)):
-                if df["long"].iloc[i] == 1 and df["long"].iloc[i - 1] == 0:
-                    entry_price = df["Close"].iloc[i]
-                if df["long"].iloc[i] == 0 and df["long"].iloc[i - 1] == 1 and entry_price is not None:
-                    exit_price = df["Close"].iloc[i]
-                    trades.append(exit_price / entry_price - 1)
-                    entry_price = None
-            win_rate = np.mean([1 if r > 0 else 0 for r in trades]) if trades else np.nan
-            num_trades = len(trades)
-        else:
-            win_rate = np.nan
-            num_trades = np.nan
+    def _calculate_strategy_metrics(self):
+        df = self.df
+        ret_cols = [col for col in df.columns if col.endswith('_ret')]
+        summaries = []
+        lump_sum_roi = self.lump_sum_metrics.get("Lump Sum ROI", np.nan)
+        lump_sum_cagr = self.lump_sum_metrics.get("Lump Sum CAGR", np.nan)
+        backtest_period = self.lump_sum_metrics.get("Backtest Period", "N/A")
 
-        # Compare to lump sum if available
-        lump_sum_metrics = {}
-        if "strat_lump_sum" in df.columns:
-            lump_portfolio = df["strat_lump_sum"].ffill()
-            lump_total_return = lump_portfolio.iloc[-1] / lump_portfolio.iloc[0] - 1
-            lump_cagr = (lump_portfolio.iloc[-1] / lump_portfolio.iloc[0]) ** (1 / years) - 1 if years > 0 else np.nan
-            lump_sum_metrics = {
-                "Lump Sum ROI": f"{lump_total_return * 100:.2f}%",
-                "Lump Sum CAGR": f"{lump_cagr * 100:.2f}%" if years == years else "N/A"
+        for col in ret_cols:
+            strat = col.replace('_ret', '')
+            portfolio = df[col].copy().ffill()
+            total_return = portfolio.iloc[-1] / portfolio.iloc[0] - 1
+            days = (df.index[-1] - df.index[0]).days
+            years = days / 365.25 if days > 0 else np.nan
+            cagr = (portfolio.iloc[-1] / portfolio.iloc[0]) ** (1 / years) - 1 if years > 0 else np.nan
+
+            # Win rate and number of trades
+            trades = []
+            entry_price = None
+            long_col = f"{strat}_long"
+            if long_col in df.columns and "Close" in df.columns:
+                for i in range(1, len(df)):
+                    if df[long_col].iloc[i] == 1 and df[long_col].iloc[i - 1] == 0:
+                        entry_price = df["Close"].iloc[i]
+                    if df[long_col].iloc[i] == 0 and df[long_col].iloc[i - 1] == 1 and entry_price is not None:
+                        exit_price = df["Close"].iloc[i]
+                        trades.append(exit_price / entry_price - 1)
+                        entry_price = None
+                win_rate = np.mean([1 if r > 0 else 0 for r in trades]) if trades else np.nan
+                num_trades = len(trades)
+            else:
+                win_rate = np.nan
+                num_trades = np.nan
+
+            # Calculate ratio of strategy ROI to lump sum ROI
+            roi_ratio = (total_return / lump_sum_roi) if lump_sum_roi != 0 and not np.isnan(lump_sum_roi) else np.nan
+
+            metrics = {
+                "Ticker": self.ticker,
+                "Strategy": strat,
+                "Backtest Period": backtest_period,
+                "Total ROI": f"{total_return * 100:.2f}%",
+                "CAGR": f"{cagr * 100:.2f}%" if years == years else "N/A",
+                "Win Rate": f"{win_rate * 100:.2f}%" if not np.isnan(win_rate) else "N/A",
+                "Number of Trades": num_trades if not np.isnan(num_trades) else "N/A",
+                "Lump Sum ROI": f"{lump_sum_roi * 100:.2f}%" if not np.isnan(lump_sum_roi) else "N/A",
+                "Lump Sum CAGR": f"{lump_sum_cagr * 100:.2f}%" if not np.isnan(lump_sum_cagr) else "N/A",
+                "ROI Ratio (Strategy/Lump Sum)": f"{roi_ratio:.2f}" if not np.isnan(roi_ratio) else "N/A"
             }
-        else:
-            lump_sum_metrics = {
-                "Lump Sum ROI": "N/A",
-                "Lump Sum CAGR": "N/A"
-            }
+            summaries.append(metrics)
 
-        results = pd.DataFrame({
-            "Metric": [
-                "Backtest Period",
-                "Strategy",
-                "Total ROI",
-                "CAGR",
-                "Win Rate",
-                "Number of Trades",
-                "Lump Sum ROI",
-                "Lump Sum CAGR"
-            ],
-            "Value": [
-                f"{df.index[0].date()} to {df.index[-1].date()} ({years:.1f} years)" if years == years else "N/A",
-                strategy_col,
-                f"{total_return * 100:.2f}%",
-                f"{cagr * 100:.2f}%" if years == years else "N/A",
-                f"{win_rate * 100:.2f}%" if not np.isnan(win_rate) else "N/A",
-                num_trades if not np.isnan(num_trades) else "N/A",
-                lump_sum_metrics["Lump Sum ROI"],
-                lump_sum_metrics["Lump Sum CAGR"]
-            ]
-        })
-        return results
+        self.summary = pd.DataFrame(summaries) if summaries else pd.DataFrame([{
+            "Ticker": self.ticker,
+            "Strategy": "N/A",
+            "Backtest Period": "N/A",
+            "Total ROI": "N/A",
+            "CAGR": "N/A",
+            "Win Rate": "N/A",
+            "Number of Trades": "N/A",
+            "Lump Sum ROI": "N/A",
+            "Lump Sum CAGR": "N/A",
+            "ROI Ratio (Strategy/Lump Sum)": "N/A"
+        }])
 
-    # Simulate the trading strategy
-    initial_capital = 1000.0
-    df = _simulate_strategy(df, initial_capital)
-    df = _calculate_lump_sum(df, initial_capital)
 
-    # Output results
-    if result_csv:
-        df.to_csv(result_csv, index=True)
-        # Calculate performance metrics
-        results = _calculate_performance_metrics(df)
-        summary_file = os.path.join(results_dir, f"{ticker}_performance_summary.csv")
-        results.to_csv(summary_file, index=False)
-        print(f"Backtesting results saved to {result_csv}")
+    def run(self):
+
+        self.initial_capital = 1000.0
+        self._simulate_lump_sum()
+        self._calculate_lump_sum_metrics()
+
+        self.str_prefix = "str_def"
+        self._simulate_strategy()
+        self._calculate_strategy_metrics()
+
+        # Save results to CSV
+        if self.results_csv:
+            self.df.to_csv(self.results_csv, index=True)
+            # Calculate performance metrics
+            self._calculate_strategy_metrics()
+            # Append to existing summary CSV if it exists, else create new
+            if os.path.exists(strategies_fpath):
+                existing = pd.read_csv(strategies_fpath)
+                combined = pd.concat([existing, self.summary], ignore_index=True)
+                combined.to_csv(strategies_fpath, index=False)
+            else:
+                self.summary.to_csv(strategies_fpath, index=False)
+            print(f"--- Backtesting results saved.")
+        return self.df
+
 
 class Ploter:
     def __init__(self, ticker, df, date_range=None):
@@ -356,8 +395,8 @@ class Ploter:
         # Plot signals
         def _plot_signals():
             # Plot buy (green up) and sell (red down) arrows for signals
-            buy_signals = self.df[self.df["signal"] == 1]
-            sell_signals = self.df[self.df["signal"] == -1]
+            buy_signals = self.df[self.df["str_def_signal"] == 1]
+            sell_signals = self.df[self.df["str_def_signal"] == -1]
 
             plt.scatter(
                     mdates.date2num(buy_signals.index),
@@ -376,6 +415,21 @@ class Ploter:
                     label="Sell Signal"
                 )
         _plot_signals()
+
+        def _plot_backtest_results():
+            # Plot backtest results on a secondary Y axis
+            ax = plt.gca()
+            ax2 = ax.twinx()
+            if "strat_ret" in self.df.columns:
+                ax2.plot(self.df.index, self.df["strat_ret"], label="Strategy Portfolio Value", color="purple", linestyle='--')
+            if "strat_lump_sum" in self.df.columns:
+                ax2.plot(self.df.index, self.df["strat_lump_sum"], label="Lump Sum Portfolio Value", color="gray", linestyle='--')
+            ax2.set_ylabel("Profit & Loss")
+            # Combine legends from both axes
+            lines, labels = ax.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax2.legend(lines + lines2, labels + labels2, loc="upper left")
+        _plot_backtest_results()
 
         plt.title(f"{self.ticker} Price and EMA Trend Coloring")
         plt.xlabel("Date")
@@ -414,8 +468,8 @@ class Ploter:
         # Plot buy/sell signals as markers (disabled by default)
         signal_markers = []
         if False:
-            buy_signals = df[(df["long"].diff() == 1)]
-            sell_signals = df[(df["long"].diff() == -1)]
+            buy_signals = df[(df["str_def_long"].diff() == 1)]
+            sell_signals = df[(df["str_def_long"].diff() == -1)]
             if not buy_signals.empty:
                 signal_markers.append(mpf.make_addplot(buy_signals["Close"], type='scatter', markersize=100, marker='^', color='lime', label='Buy'))
             if not sell_signals.empty:
@@ -437,29 +491,31 @@ class Ploter:
             datetime_format='%Y-%m'
         )
 
+
 if __name__ == "__main__":
     if False: # Fetch and save data for multiple tickers
         tickers = ["BTC-USD", "SOL-USD", "SUI-USD"]
         fetch_and_save_data(tickers)
 
     if True: # Backtest and plot for a specific ticker
-        ticker = "BTC-USD"
+        ticker = "SUI-USD"
 
         # Check if indicators file exists
-        results_fpath = os.path.join(results_dir, f"{ticker}_data_indicators_signals.csv")
-        overwrite = True
-
-        if not overwrite and os.path.exists(results_fpath):
-            print(f"Indicators for {ticker} already exist. Loading existing data.")
-            df = pd.read_csv(results_fpath, parse_dates=["Date"], index_col="Date")
+        results_csv = os.path.join(results_dir, f"{ticker}_data_indicators_signals.csv")
+        
+        overwrite = False
+        if not overwrite and os.path.exists(results_csv):
+            print(f"-- Indicators for {ticker} already exist. Loading existing data.")
+            df = pd.read_csv(results_csv, parse_dates=["Date"], index_col="Date")
         else: # Load ticker data
             df = load_ticker_data(ticker, data_fpath)
         # Compute indicator values
-        df = get_indicators(ticker, df, results_fpath)
+        df = get_default_indicators(ticker, df, results_csv)
         # Get trading signals
-        df = get_signals(ticker, df, results_fpath)
-        if True:
-            df = get_backtest(ticker, df, results_fpath)
+        df = get_default_signals(ticker, df, results_csv)
+        # Get backtest results
+        bt = Backtest(ticker, df, results_csv)
+        bt.run()
 
         if False:
             date_range = ("2023-01-01", "2025-01-01")

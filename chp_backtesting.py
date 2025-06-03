@@ -10,7 +10,7 @@ import matplotlib.dates as mdates
 main_dir = os.path.dirname(os.path.abspath(__file__))
 data_dir = os.path.join(main_dir, "data")
 results_dir = os.path.join(main_dir, "results")
-data_fpath = os.path.join(data_dir, "crypto_data.csv")
+data_fpath = os.path.join(data_dir, "time_series.csv")
 strategies_fpath = os.path.join(results_dir, "!strategies_performance_summary.csv")
 
 # Function to fetch and save data for multiple tickers
@@ -31,12 +31,33 @@ def fetch_and_save_data(tickers, filename=data_fpath):
         existing_tickers = []
 
     end = datetime.today()
-    start = end - timedelta(days=365*5)
+    start = datetime(2020, 6, 1)
 
     for ticker in tickers:
-        if ticker not in existing_tickers:
+        ticker_cols = [f"{ticker}_Open", f"{ticker}_High", f"{ticker}_Low", f"{ticker}_Close"]
+        if ticker in existing_tickers:
+            # Find missing dates for this ticker
+            ticker_dates = existing_data[[col for col in existing_data.columns if col.startswith(f"{ticker}_")]].dropna().index
+            all_dates = pd.date_range(start=start, end=end, freq="D")
+            missing_dates = sorted(set(all_dates.date) - set(ticker_dates.date))
+            if missing_dates:
+                print(f"Fetching missing dates for {ticker}: {missing_dates[0]} to {missing_dates[-1]}")
+                # Download only missing dates
+                df_new = yf.download(
+                    ticker,
+                    start=missing_dates[0],
+                    end=(missing_dates[-1] + timedelta(days=1)),
+                    progress=False
+                )[["Low", "Open", "Close", "High"]].dropna()
+                df_new.columns = [f'{ticker}_Low', f'{ticker}_Open', f'{ticker}_Close', f'{ticker}_High']
+                # Only keep rows for missing dates
+                df_new = df_new[np.isin(df_new.index.date, missing_dates)]
+                if not df_new.empty:
+                    # Join new data to existing_data
+                    existing_data = existing_data.combine_first(df_new)
+        else:
             print(f"Fetching data for {ticker}...")
-            df = yf.download(ticker, start=start, end=end, progress=False)[["Low","Open","Close","High"]].dropna()
+            df = yf.download(ticker, start=start, end=end, progress=False)[["Low", "Open", "Close", "High"]].dropna()
             df.columns = [f'{ticker}_Low', f'{ticker}_Open', f'{ticker}_Close', f'{ticker}_High']
             if existing_data.empty:
                 existing_data = df
@@ -44,131 +65,160 @@ def fetch_and_save_data(tickers, filename=data_fpath):
                 existing_data = existing_data.join(df, how='outer')
 
     if not existing_data.empty:
+        existing_data.sort_index(inplace=True)
         existing_data.to_csv(filename)
         print(f"Data saved to {filename}")
     else:
         print("No new data fetched.")
 
 
-def load_ticker_data(ticker, filename):
-    existing_data = pd.read_csv(filename, parse_dates=["Date"], index_col="Date")
-    # Filter columns for the specified ticker
-    ticker_columns = [col for col in existing_data.columns if col.startswith(f"{ticker}_")]
-    if not ticker_columns:
-        print(f"No data found for ticker {ticker}")
-        return None
-    df = existing_data[ticker_columns].copy()
-    df.columns = [col.split('_')[1] for col in ticker_columns]  # Rename columns to 'Open', 'Close', etc.
-    if df.empty:
-        print(f"No data found for ticker {ticker}")
-        return None
-    return df
+class Calc:
+    def __init__(self, ticker, filename, timeframe='1D', results_csv=None):
+        self.ticker = ticker
+        self.filename = filename
+        self.timeframe = timeframe
+        self.results_csv = results_csv
 
-def get_default_indicators(ticker, df, result_csv=None):
-    # Pine parameters
-    fast_len, slow_len, atr_len, atr_mult = 30, 60, 60, 0.30
+    def get_ticker_data(self):
+        existing_data = pd.read_csv(self.filename, parse_dates=["Date"], index_col="Date")
+        # Filter columns for the specified ticker
+        ticker_columns = [col for col in existing_data.columns if col.startswith(f"{self.ticker}_")]
+        if not ticker_columns:
+            print(f"No data found for ticker {self.ticker}")
+            return None
+        df = existing_data[ticker_columns].copy()
+        df.columns = [col.split('_')[1] for col in ticker_columns]  # Rename columns to 'Open', 'Close', etc.
+        if df.empty:
+            print(f"No data found for ticker {self.ticker}")
+            return None
 
-    # Only compute if columns do not already exist
-    needed_cols = ["EMA_fast", "EMA_slow", "EMA_diff", 
-                   "SMA_50", "SMA_100", "SMA_150", 
-                   "ATR", "bull", "bear", "neutral", "ema_color"]
-    if all(col in df.columns for col in needed_cols):
-        print(f"-- Indicators for {ticker} already exist in DataFrame. Skipping calculation.")
-        return df
-    
-    # Calculate SMAs
-    df["SMA_50"] = df["Close"].rolling(window=50).mean()
-    df["SMA_100"] = df["Close"].rolling(window=100).mean()
-    df["SMA_150"] = df["Close"].rolling(window=150).mean()
-
-    # Calculate EMAs
-    df["EMA_fast"] = df["Close"].ewm(span=fast_len, adjust=False).mean()
-    df["EMA_slow"] = df["Close"].ewm(span=slow_len, adjust=False).mean()
-    df["EMA_diff"] = df["EMA_fast"] - df["EMA_slow"]
-
-    # Calculate ATR (PineScript style)
-    prev_close = df["Close"].shift(1)
-    tr = pd.DataFrame({
-        "tr1": df["High"] - df["Low"],
-        "tr2": (df["High"] - prev_close).abs(),
-        "tr3": (df["Low"] - prev_close).abs()
-    }).max(axis=1)
-    df["ATR"] = tr.rolling(window=atr_len).mean()
-
-    # Trend conditions for coloring
-    atr_margin = atr_mult * df["ATR"]
-    df["bull"] = df["EMA_diff"] >  atr_margin
-    df["bear"] = df["EMA_diff"] < -atr_margin
-    df["neutral"] = ~(df["bull"] | df["bear"])
-    df["ema_color"] = np.where(df["bull"], "bull", np.where(df["bear"], "bear", "neutral"))
-
-    # Save
-    if result_csv:
-        df.to_csv(result_csv, index=True)
-        print(f"--- Indicators for {ticker} saved.")
-    return df
-
-def get_default_signals(ticker, df, result_csv=None):
-    # Skip if columns that start with "str_def" already exist
-    if any(col.startswith("str_def") for col in df.columns):
-        print(f"-- Signals for {ticker} already exist in DataFrame. Skipping calculation.")
+        # Resample if timeframe is not '1D'
+        if self.timeframe != '1D':
+            if self.timeframe == '2D':
+                df = df.resample('2D').agg({
+                    'Open': 'first',
+                    'High': 'max',
+                    'Low': 'min',
+                    'Close': 'last'
+                }).dropna()
+            else:
+                print(f"Unsupported timeframe: {self.timeframe}")
+                return None
+        self.df = df
         return df
 
-    df["str_def_long"] = 0
-    df["str_def_signal"] = 0
+    def get_default_indicators(self):
+        df = self.df
+        # Pine parameters
+        fast_len, slow_len, atr_len, atr_mult = 30, 60, 60, 0.30
 
-    # Buy signal: when bull turns True (from not bull)
-    buy_signal = (df["bull"] & ~df["bull"].shift(1).astype(bool).fillna(False))
-    # Sell signal: when bear turns True (from not bear)
-    sell_signal = (df["bear"] & ~df["bear"].shift(1).astype(bool).fillna(False))
+        # Only compute if columns do not already exist
+        needed_cols = ["EMA_fast", "EMA_slow", "EMA_diff", 
+                    "SMA_50", "SMA_100", "SMA_150", 
+                    "ATR", "bull", "bear", "neutral", "ema_color"]
+        if all(col in df.columns for col in needed_cols):
+            print(f"-- Indicators for {self.ticker} already exist in DataFrame. Skipping calculation.")
+            return df
+        
+        # Calculate SMAs
+        df["SMA_50"] = df["Close"].rolling(window=50).mean()
+        df["SMA_100"] = df["Close"].rolling(window=100).mean()
+        df["SMA_150"] = df["Close"].rolling(window=150).mean()
 
-    df.loc[buy_signal, "str_def_signal"] = 1   # Buy
-    df.loc[sell_signal, "str_def_signal"] = -1 # Sell
+        # Calculate EMAs
+        df["EMA_fast"] = df["Close"].ewm(span=fast_len, adjust=False).mean()
+        df["EMA_slow"] = df["Close"].ewm(span=slow_len, adjust=False).mean()
+        df["EMA_diff"] = df["EMA_fast"] - df["EMA_slow"]
 
-    # Forward fill long position: in position after buy, out after sell
-    in_position = False
-    for i in range(len(df)):
-        if df["str_def_signal"].iloc[i] == 1:
-            in_position = True
-        elif df["str_def_signal"].iloc[i] == -1:
-            in_position = False
-        df.at[df.index[i], "str_def_long"] = int(in_position)
-    
-    # Save if needed
-    if result_csv:
-        df.to_csv(result_csv, index=True)
-        print(f"--- Signals for {ticker} saved to.")
-    return df
+        # Calculate ATR (PineScript style)
+        prev_close = df["Close"].shift(1)
+        tr = pd.DataFrame({
+            "tr1": df["High"] - df["Low"],
+            "tr2": (df["High"] - prev_close).abs(),
+            "tr3": (df["Low"] - prev_close).abs()
+        }).max(axis=1)
+        df["ATR"] = tr.rolling(window=atr_len).mean()
+
+        # Trend conditions for coloring
+        atr_margin = atr_mult * df["ATR"]
+        df["bull"] = df["EMA_diff"] >  atr_margin
+        df["bear"] = df["EMA_diff"] < -atr_margin
+        df["neutral"] = ~(df["bull"] | df["bear"])
+        df["ema_color"] = np.where(df["bull"], "bull", np.where(df["bear"], "bear", "neutral"))
+
+        # Save
+        df.to_csv(self.results_csv, index=True)
+        print(f"--- Indicators for {self.ticker} saved with {self.timeframe} timeframe.")
+        self.df = df
+        return df
+
+    def get_default_signals(self):
+        df = self.df
+        # Skip if columns that start with "str_def" already exist
+        if any(col.startswith("str_def") for col in df.columns):
+            print(f"-- Signals for {self.ticker} already exist in DataFrame. Skipping calculation.")
+            return df
+
+        df["str_def_long"] = 0
+        df["str_def_signal"] = 0
+
+        # Buy signal: when bull turns True (from not bull)
+        buy_signal = (df["bull"] & ~df["bull"].shift(1).astype(bool).fillna(False))
+        # Sell signal: when bear turns True (from not bear)
+        sell_signal = (df["bear"] & ~df["bear"].shift(1).astype(bool).fillna(False))
+
+        df.loc[buy_signal, "str_def_signal"] = 1   # Buy
+        df.loc[sell_signal, "str_def_signal"] = -1 # Sell
+
+        # Forward fill long position: in position after buy, out after sell
+        in_position = False
+        for i in range(len(df)):
+            if df["str_def_signal"].iloc[i] == 1:
+                in_position = True
+            elif df["str_def_signal"].iloc[i] == -1:
+                in_position = False
+            df.at[df.index[i], "str_def_long"] = int(in_position)
+        
+        # Save if needed
+        df.to_csv(self.results_csv, index=True)
+        print(f"--- Signals for {self.ticker} with {self.timeframe} saved.")
+        self.df = df
+        return df
 
 
 class Backtest():
-    def __init__(self, ticker, df, results_csv=None):
+    def __init__(self, ticker, df, period=None, timeframe="1D", results_csv=None):
         self.ticker = ticker
         self.df = df
+        self.period = period
+        self.timeframe = timeframe
         self.results_csv = results_csv
         self.summary = None
+
+        # Filter DataFrame by period if provided
+        if self.period is not None:
+            start_date = pd.to_datetime(self.period[0])
+            end_date = pd.to_datetime(self.period[1])
+            self.df = self.df.loc[(self.df.index >= start_date) & (self.df.index <= end_date)].copy()
 
     def _simulate_lump_sum(self):
         df = self.df
         initial_capital = self.initial_capital
-        # Lump sum buy-and-hold: buy at first long==1, sell at last long==0 after being in position
+        # Lump sum buy-and-hold: buy at first long==1, sell at last available date
         df["str_lump_sum"] = initial_capital
         long_diff = df["str_def_long"].diff().fillna(0)
         first_buy_idx = df.index[long_diff == 1]
-        last_sell_idx = df.index[long_diff == -1]
-        if not first_buy_idx.empty and not last_sell_idx.empty:
+        if not first_buy_idx.empty:
             buy_idx = first_buy_idx[0]
-            sell_idx = last_sell_idx[-1]
+            sell_idx = df.index[-1]
             buy_price = df.at[buy_idx, "Close"]
-            sell_price = df.at[sell_idx, "Close"]
+            #sell_price = df.at[sell_idx, "Close"]
             shares_lump = initial_capital / buy_price
             for idx in df.index:
                 if idx < buy_idx:
                     df.at[idx, "str_lump_sum"] = initial_capital
                 elif buy_idx <= idx <= sell_idx:
                     df.at[idx, "str_lump_sum"] = shares_lump * df.at[idx, "Close"]
-                else:
-                    df.at[idx, "str_lump_sum"] = shares_lump * sell_price
         self.df = df
 
     def _simulate_strategy(self):
@@ -196,7 +246,6 @@ class Backtest():
             # Update portfolio value
             df.at[df.index[i], f"{str_prefix}_ret"] = cash + shares * price
         self.df = df
-
 
     def _calculate_lump_sum_metrics(self):
         df = self.df
@@ -254,6 +303,7 @@ class Backtest():
                 "Ticker": self.ticker,
                 "Strategy": strat,
                 "Backtest Period": backtest_period,
+                "Timeframe": self.timeframe,
                 "Total ROI": f"{total_return * 100:.2f}%",
                 "CAGR": f"{cagr * 100:.2f}%" if years == years else "N/A",
                 "Win Rate": f"{win_rate * 100:.2f}%" if not np.isnan(win_rate) else "N/A",
@@ -268,6 +318,7 @@ class Backtest():
             "Ticker": self.ticker,
             "Strategy": "N/A",
             "Backtest Period": "N/A",
+            "Timeframe": self.timeframe,
             "Total ROI": "N/A",
             "CAGR": "N/A",
             "Win Rate": "N/A",
@@ -277,9 +328,7 @@ class Backtest():
             "ROI Ratio (Strategy/Lump Sum)": "N/A"
         }])
 
-
     def run(self):
-
         self.initial_capital = 1000.0
         self._simulate_lump_sum()
         self._calculate_lump_sum_metrics()
@@ -305,15 +354,15 @@ class Backtest():
 
 
 class Ploter:
-    def __init__(self, ticker, df, date_range=None):
+    def __init__(self, ticker, df, period=None):
         self.ticker = ticker
         self.df = df
-        self.date_range = date_range
+        self.period = period
 
         # If date_range is provided, filter the DataFrame
-        if date_range is not None:
-            start_date = pd.to_datetime(date_range[0], format='%Y-%m-%d')
-            end_date = pd.to_datetime(date_range[1], format='%Y-%m-%d')
+        if period is not None:
+            start_date = pd.to_datetime(period[0], format='%Y-%m-%d')
+            end_date = pd.to_datetime(period[1], format='%Y-%m-%d')
             self.df = self.df.loc[(self.df.index >= start_date) & (self.df.index <= end_date)].copy()
 
         self.color_dict = {
@@ -416,25 +465,29 @@ class Ploter:
                 )
         _plot_signals()
 
-        def _plot_backtest_results():
+        def _plot_backtest_results(strategy_prefix="str_def"):
             # Plot backtest results on a secondary Y axis
             ax = plt.gca()
             ax2 = ax.twinx()
-            if "strat_ret" in self.df.columns:
-                ax2.plot(self.df.index, self.df["strat_ret"], label="Strategy Portfolio Value", color="purple", linestyle='--')
-            if "strat_lump_sum" in self.df.columns:
-                ax2.plot(self.df.index, self.df["strat_lump_sum"], label="Lump Sum Portfolio Value", color="gray", linestyle='--')
+            str_col = f"{strategy_prefix}_ret"
+            if str_col in self.df.columns:
+                ax2.plot(self.df.index, self.df[str_col], label="Strategy Portfolio Value", color="purple", linestyle='--')
+            if "str_lump_sum" in self.df.columns:
+                ax2.plot(self.df.index, self.df["str_lump_sum"], label="Lump Sum Portfolio Value", color="gray", linestyle='--')
             ax2.set_ylabel("Profit & Loss")
             # Combine legends from both axes
             lines, labels = ax.get_legend_handles_labels()
             lines2, labels2 = ax2.get_legend_handles_labels()
             ax2.legend(lines + lines2, labels + labels2, loc="upper left")
-        _plot_backtest_results()
 
+        plt.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.7)
         plt.title(f"{self.ticker} Price and EMA Trend Coloring")
         plt.xlabel("Date")
         plt.ylabel("Price")
         plt.legend()
+
+        _plot_backtest_results()
+
         plt.tight_layout()
         plt.show()
 
@@ -494,30 +547,34 @@ class Ploter:
 
 if __name__ == "__main__":
     if False: # Fetch and save data for multiple tickers
-        tickers = ["BTC-USD", "SOL-USD", "SUI-USD"]
+        tickers = ["BTC-USD","SOL-USD"]
         fetch_and_save_data(tickers)
 
     if True: # Backtest and plot for a specific ticker
-        ticker = "SUI-USD"
+        ticker = "BTC-USD"
+        timeframe = '2D'
 
         # Check if indicators file exists
-        results_csv = os.path.join(results_dir, f"{ticker}_data_indicators_signals.csv")
-        
         overwrite = False
+        results_csv = os.path.join(results_dir, f"{ticker}_{timeframe}_data_indicators_signals.csv")
         if not overwrite and os.path.exists(results_csv):
-            print(f"-- Indicators for {ticker} already exist. Loading existing data.")
+            print(f"--- Indicators and signals for {ticker} already exist. Skipping calculation.")
             df = pd.read_csv(results_csv, parse_dates=["Date"], index_col="Date")
-        else: # Load ticker data
-            df = load_ticker_data(ticker, data_fpath)
-        # Compute indicator values
-        df = get_default_indicators(ticker, df, results_csv)
-        # Get trading signals
-        df = get_default_signals(ticker, df, results_csv)
-        # Get backtest results
-        bt = Backtest(ticker, df, results_csv)
-        bt.run()
+        else:
+            calc = Calc(ticker=ticker, filename=data_fpath, timeframe=timeframe, results_csv=results_csv)
+            # Load ticker data
+            df = calc.get_ticker_data()
+            # Compute indicator values
+            df = calc.get_default_indicators()
+            # Get trading signals
+            df = calc.get_default_signals()
 
-        if False:
-            date_range = ("2023-01-01", "2025-01-01")
-            ploter = Ploter(ticker, df, date_range=date_range)
+        if False: # Get backtest results
+            period = ("2023-01-01", "2025-06-01")
+            bt = Backtest(ticker, df, period, timeframe, results_csv)
+            bt.run()
+
+        if True: # Plot results
+            date_range = ("2023-01-01", "2025-06-01")
+            ploter = Ploter(ticker, df, period=date_range)
             ploter.plot_plt()

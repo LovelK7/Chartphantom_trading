@@ -10,77 +10,113 @@ import matplotlib.dates as mdates
 main_dir = os.path.dirname(os.path.abspath(__file__))
 data_dir = os.path.join(main_dir, "data")
 results_dir = os.path.join(main_dir, "results")
-data_fpath = os.path.join(data_dir, "time_series.csv")
 strategies_fpath = os.path.join(results_dir, "!strategies_performance_summary.csv")
 
-# Function to fetch and save data for multiple tickers
-def fetch_and_save_data(tickers, filename=data_fpath):
-    """
-    Fetch historical data for multiple tickers and save to a CSV file.
-    tickers: List of ticker symbols to fetch data for.
-    filename: Path to the CSV file where data will be saved.
-    """
-    print(f"Fetching data for tickers: {', '.join(tickers)}")
-    os.makedirs(data_dir, exist_ok=True)
-    os.makedirs(results_dir, exist_ok=True)
-    try:
-        existing_data = pd.read_csv(filename, parse_dates=["Date"], index_col="Date")
-        existing_tickers = list({col.split('_')[0] for col in existing_data.columns if '_' in col})
-    except (FileNotFoundError, pd.errors.EmptyDataError):
-        existing_data = pd.DataFrame()
-        existing_tickers = []
-
-    end = datetime.today()
-    start = datetime(2020, 6, 1)
-
-    for ticker in tickers:
-        ticker_cols = [f"{ticker}_Open", f"{ticker}_High", f"{ticker}_Low", f"{ticker}_Close"]
-        if ticker in existing_tickers:
-            # Find missing dates for this ticker
-            ticker_dates = existing_data[[col for col in existing_data.columns if col.startswith(f"{ticker}_")]].dropna().index
-            all_dates = pd.date_range(start=start, end=end, freq="D")
-            missing_dates = sorted(set(all_dates.date) - set(ticker_dates.date))
-            if missing_dates:
-                print(f"Fetching missing dates for {ticker}: {missing_dates[0]} to {missing_dates[-1]}")
-                # Download only missing dates
-                df_new = yf.download(
-                    ticker,
-                    start=missing_dates[0],
-                    end=(missing_dates[-1] + timedelta(days=1)),
-                    progress=False
-                )[["Low", "Open", "Close", "High"]].dropna()
-                df_new.columns = [f'{ticker}_Low', f'{ticker}_Open', f'{ticker}_Close', f'{ticker}_High']
-                # Only keep rows for missing dates
-                df_new = df_new[np.isin(df_new.index.date, missing_dates)]
-                if not df_new.empty:
-                    # Join new data to existing_data
-                    existing_data = existing_data.combine_first(df_new)
+class YF:
+    def __init__(self, tickers, asset_type, start_date=None, end_date=None):
+        self.tickers = tickers
+        self.asset_data = os.path.join(data_dir, f"{asset_type}.csv")
+        self.start_date = start_date if start_date else datetime(2020, 6, 1)
+        self.end_date = end_date if end_date else datetime.today()
+        self.data = None
+    
+    def search_query(self, query):
+        """
+        Search for tickers based on a query string.
+        Returns a list of ticker symbols that match the query.
+        """
+        results = yf.Search(query)
+        # yfinance's Search returns a Search object, not a dict
+        # Use .quotes to get the list of results
+        if hasattr(results, "quotes"):
+            quotes = results.quotes
+            if quotes:
+                # Print header
+                print(f"{'Symbol':<15} {'Short Name':<40} {'Type':<15} {'Exchange':<15}")
+                print("-" * 75)
+                for q in quotes:
+                    symbol = q.get("symbol", "")
+                    shortname = q.get("shortname", "")
+                    exchange = q.get("exchange", "")
+                    quote_type = q.get("quoteType", "")
+                    print(f"{symbol:<15} {shortname:<40} {quote_type:<15} {exchange:<15}")
         else:
-            print(f"Fetching data for {ticker}...")
-            df = yf.download(ticker, start=start, end=end, progress=False)[["Low", "Open", "Close", "High"]].dropna()
-            df.columns = [f'{ticker}_Low', f'{ticker}_Open', f'{ticker}_Close', f'{ticker}_High']
-            if existing_data.empty:
-                existing_data = df
-            else:
-                existing_data = existing_data.join(df, how='outer')
+            print("No quotes found for query.")
+            return []
+            
+    def fetch_and_save_data(self):
+        """
+        Fetch historical data for multiple tickers and save to a CSV file.
+        tickers: List of ticker symbols to fetch data for.
+        filename: Path to the CSV file where data will be saved.
+        """
+        print(f"Fetching data for tickers: {', '.join(tickers)}")
+        if os.path.exists(self.asset_data):
+            def parse_date(date_str):
+                for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%m/%d/%Y", "%Y/%m/%d"):
+                    try:
+                        return pd.to_datetime(date_str, format=fmt)
+                    except (ValueError, TypeError):
+                        continue
+                return pd.to_datetime(date_str, errors='coerce')
+            existing_data = pd.read_csv(self.asset_data, parse_dates=["Date"], index_col="Date", date_parser=parse_date)
+            existing_tickers = list({col.split('_')[0] for col in existing_data.columns if '_' in col})
+        else:
+            existing_data = pd.DataFrame()
+            existing_tickers = []
 
-    if not existing_data.empty:
-        existing_data.sort_index(inplace=True)
-        existing_data.to_csv(filename)
-        print(f"Data saved to {filename}")
-    else:
-        print("No new data fetched.")
+        end = datetime.today() - timedelta(days=1)
+        start = datetime(2020, 6, 1)
+
+        for ticker in tickers:
+            ticker_cols = [f"{ticker}_Open", f"{ticker}_High", f"{ticker}_Low", f"{ticker}_Close"]
+            if ticker in existing_tickers:
+                # Find missing dates for this ticker
+                ticker_dates = existing_data[[col for col in existing_data.columns if col.startswith(f"{ticker}_")]].dropna().index
+                all_dates = pd.date_range(start=start, end=end, freq="D")
+                missing_dates = sorted(set(all_dates.date) - set(ticker_dates.date))
+                if missing_dates:
+                    print(f"Fetching missing dates for {ticker}: {missing_dates[0]} to {missing_dates[-1]}")
+                    # Download only missing dates
+                    df_new = yf.download(
+                        ticker,
+                        start=missing_dates[0],
+                        end=(missing_dates[-1] + timedelta(days=1)),
+                        progress=False
+                    )[["Low", "Open", "Close", "High"]].dropna()
+                    df_new.columns = [f'{ticker}_Low', f'{ticker}_Open', f'{ticker}_Close', f'{ticker}_High']
+                    # Only keep rows for missing dates
+                    df_new = df_new[np.isin(df_new.index.date, missing_dates)]
+                    if not df_new.empty:
+                        # Join new data to existing_data
+                        existing_data = existing_data.combine_first(df_new)
+            else:
+                print(f"Fetching data for {ticker}...")
+                df = yf.download(ticker, start=start, end=end, progress=False)[["Low", "Open", "Close", "High"]].dropna()
+                df.columns = [f'{ticker}_Low', f'{ticker}_Open', f'{ticker}_Close', f'{ticker}_High']
+                if existing_data.empty:
+                    existing_data = df
+                else:
+                    existing_data = existing_data.join(df, how='outer')
+
+        if not existing_data.empty:
+            existing_data.sort_index(inplace=True)
+            existing_data.to_csv(self.asset_data)
+            print(f"Data saved to {os.path.basename(self.asset_data)}")
+        else:
+            print("No new data fetched.")
 
 
 class Calc:
-    def __init__(self, ticker, filename, timeframe='1D', results_csv=None):
+    def __init__(self, ticker, asset_type, timeframe='1D', results_csv=None):
         self.ticker = ticker
-        self.filename = filename
+        self.asset_data = os.path.join(data_dir, f"{asset_type}.csv")
         self.timeframe = timeframe
         self.results_csv = results_csv
 
     def get_ticker_data(self):
-        existing_data = pd.read_csv(self.filename, parse_dates=["Date"], index_col="Date")
+        existing_data = pd.read_csv(self.asset_data, index_col="Date")
+        existing_data.index = pd.to_datetime(existing_data.index, errors='coerce')
         # Filter columns for the specified ticker
         ticker_columns = [col for col in existing_data.columns if col.startswith(f"{self.ticker}_")]
         if not ticker_columns:
@@ -546,13 +582,26 @@ class Ploter:
 
 
 if __name__ == "__main__":
-    if False: # Fetch and save data for multiple tickers
-        tickers = ["BTC-USD","SOL-USD"]
-        fetch_and_save_data(tickers)
 
-    if True: # Backtest and plot for a specific ticker
-        ticker = "BTC-USD"
-        timeframe = '2D'
+    if False: # Fetch and save data for multiple tickers
+
+        #asset_type = "equity"
+        #tickers = ['TL0.DE','MIGA.BE','1X00.BE','1NW.BE','NVD.DE','TT8.DE','1QZ.DE','M44.BE','SGM.BE']
+
+        asset_type = "crypto-USD"
+        tickers = ['SUI20947-USD'] #["BTC-USD","SOL-USD"]
+
+        yfin = YF(tickers, asset_type)
+        if False: # Check if tickers are valid
+            query = 'sui-usd'
+            yfin.search_query(query)
+        if True:
+            yfin.fetch_and_save_data()
+
+    else: # Calculate, backtest and plot specific ticker
+        asset_type = 'crypto-USD'
+        ticker = 'SOL-USD'
+        timeframe = '1D'
 
         # Check if indicators file exists
         overwrite = False
@@ -561,7 +610,7 @@ if __name__ == "__main__":
             print(f"--- Indicators and signals for {ticker} already exist. Skipping calculation.")
             df = pd.read_csv(results_csv, parse_dates=["Date"], index_col="Date")
         else:
-            calc = Calc(ticker=ticker, filename=data_fpath, timeframe=timeframe, results_csv=results_csv)
+            calc = Calc(ticker, asset_type, timeframe, results_csv)
             # Load ticker data
             df = calc.get_ticker_data()
             # Compute indicator values
@@ -569,12 +618,12 @@ if __name__ == "__main__":
             # Get trading signals
             df = calc.get_default_signals()
 
-        if False: # Get backtest results
+        if True: # Get backtest results
             period = ("2023-01-01", "2025-06-01")
             bt = Backtest(ticker, df, period, timeframe, results_csv)
             bt.run()
 
-        if True: # Plot results
+        if False: # Plot results
             date_range = ("2023-01-01", "2025-06-01")
             ploter = Ploter(ticker, df, period=date_range)
             ploter.plot_plt()

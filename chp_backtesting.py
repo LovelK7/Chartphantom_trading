@@ -12,15 +12,20 @@ data_dir = os.path.join(main_dir, "data")
 results_dir = os.path.join(main_dir, "results")
 figs_dir = os.path.join(main_dir, "figures")
 strategies_fpath = os.path.join(results_dir, "!strategies_performance_summary.csv")
+tickers_fpath = os.path.join(data_dir, "tickers.csv")
 
 class YF:
-    def __init__(self, tickers, asset_type, start_date=None, end_date=None):
+    def __init__(self, tickers=None, asset_type='stocks', start_date=None, end_date=None):
         self.tickers = tickers
         self.asset_data = os.path.join(data_dir, f"{asset_type}.csv")
         self.start_date = start_date if start_date else datetime(2020, 6, 1)
         self.end_date = end_date if end_date else datetime.today()
         self.data = None
-    
+        if type(tickers) is str:
+            self.tickers = [tickers]
+        else:
+            self.tickers = pd.read_csv(tickers_fpath).get("tickers", tickers).tolist()[:7]
+
     def search_query(self, query):
         """
         Search for tickers based on a query string.
@@ -41,6 +46,9 @@ class YF:
                     exchange = q.get("exchange", "")
                     quote_type = q.get("quoteType", "")
                     print(f"{symbol:<15} {shortname:<40} {quote_type:<15} {exchange:<15}")
+            else:
+                print("No quotes found for query.")
+                return []
         else:
             print("No quotes found for query.")
             return []
@@ -54,53 +62,43 @@ class YF:
         print(f"Fetching data for tickers: {', '.join(self.tickers)}")
         if os.path.exists(self.asset_data):
             existing_data = pd.read_csv(self.asset_data, index_col="Date")
-            existing_data.index = pd.to_datetime(existing_data.index, format='%d.%m.%Y', errors='coerce')
+            existing_data.index = pd.to_datetime(existing_data.index, format='%Y-%m-%d', errors='coerce')
             existing_tickers = list({col.split('_')[0] for col in existing_data.columns if '_' in col})
         else:
             existing_data = pd.DataFrame()
             existing_tickers = []
 
+        start = datetime(2020, 6, 2)
         end = datetime.today() - timedelta(days=1)
-        start = datetime(2020, 6, 1)
 
         for ticker in self.tickers:
             #ticker_cols = [f"{ticker}_Open", f"{ticker}_High", f"{ticker}_Low", f"{ticker}_Close"]
-            if ticker in existing_tickers:
-                # Find missing dates for this ticker
-                ticker_dates = existing_data[[col for col in existing_data.columns if col.startswith(f"{ticker}_")]].dropna().index
-                all_dates = pd.date_range(start=start, end=end, freq="D")
-                missing_dates = sorted(set(all_dates.date) - set(ticker_dates.date))
-                if missing_dates:
-                    print(f"Fetching missing dates for {ticker}: {missing_dates[0]} to {missing_dates[-1]}")
-                    # Download only missing dates
-                    df_new = yf.download(
-                        ticker,
-                        start=missing_dates[0],
-                        end=(missing_dates[-1] + timedelta(days=1)),
-                        progress=False
-                    )[["Low", "Open", "Close", "High"]].dropna()
-                    df_new.columns = [f'{ticker}_Low', f'{ticker}_Open', f'{ticker}_Close', f'{ticker}_High']
-                    # Only keep rows for missing dates
-                    df_new = df_new[np.isin(df_new.index.date, missing_dates)]
-                    if not df_new.empty:
-                        # Join new data to existing_data
-                        existing_data = existing_data.combine_first(df_new)
-            else:
+            if ticker not in existing_tickers:
                 print(f"Fetching data for {ticker}...")
-                df = yf.download(ticker, start=start, end=end, progress=False)[["Low", "Open", "Close", "High"]].dropna()
+                df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)[["Low", "Open", "Close", "High"]].dropna()
                 df.columns = [f'{ticker}_Low', f'{ticker}_Open', f'{ticker}_Close', f'{ticker}_High']
                 if existing_data.empty:
                     existing_data = df
                 else:
                     existing_data = existing_data.join(df, how='outer')
-
-        if not existing_data.empty:
-            existing_data.sort_index(inplace=True)
-            existing_data.to_csv(self.asset_data)
-            print(f"Data saved to {os.path.basename(self.asset_data)}")
-        else:
-            print("No new data fetched.")
-
+                    existing_data.sort_index(inplace=True)
+                    existing_data.to_csv(self.asset_data)
+                    print(f"Data for {ticker} saved to {os.path.basename(self.asset_data)}.")
+            else:
+                last_available_date = existing_data.index.max()
+                # Update df with missing dates from last_available_date+1 up to end
+                missing_dates = pd.date_range(start=last_available_date + pd.Timedelta(days=1), end=end, freq='B')
+                if len(missing_dates) > 0:
+                    print(f"Updating {ticker} with {len(missing_dates)} missing dates...")
+                    df_new = yf.download(ticker, start=missing_dates[0], end=missing_dates[-1] + pd.Timedelta(days=1), progress=False, auto_adjust=True)[["Low", "Open", "Close", "High"]].dropna()
+                    df_new.columns = [f'{ticker}_Low', f'{ticker}_Open', f'{ticker}_Close', f'{ticker}_High']
+                    if not df_new.empty:
+                        existing_data = existing_data.combine_first(df_new)
+                        existing_data.sort_index(inplace=True)
+                        existing_data.to_csv(self.asset_data)
+                        print(f"Updated data for {ticker} saved to {os.path.basename(self.asset_data)}.")
+                    else:
+                        print(f"No new data found for {ticker}.")
 
 class Calc:
     def __init__(self, ticker, asset_type, timeframe='1D', results_csv=None):
@@ -117,12 +115,12 @@ class Calc:
         ticker_columns = [col for col in existing_data.columns if col.startswith(f"{self.ticker}_")]
         if not ticker_columns:
             print(f"No data found for ticker {self.ticker}")
-            return None
+            exit()
         df = existing_data[ticker_columns].copy()
         df.columns = [col.split('_')[1] for col in ticker_columns]  # Rename columns to 'Open', 'Close', etc.
         if df.empty:
             print(f"No data found for ticker {self.ticker}")
-            return None
+            exit()
 
         # Resample if timeframe is not '1D'
         if self.timeframe != '1D':
@@ -133,9 +131,16 @@ class Calc:
                     'Low': 'min',
                     'Close': 'last'
                 }).dropna()
+            elif self.timeframe == '1W':
+                df = df.resample('W').agg({
+                    'Open': 'first',
+                    'High': 'max',
+                    'Low': 'min',
+                    'Close': 'last'
+                }).dropna()
             else:
                 print(f"Unsupported timeframe: {self.timeframe}")
-                return None
+                exit()
         self.df = df
         return df
 
@@ -238,11 +243,15 @@ class Calc:
         ema_fast = df["EMA_fast"]
         ema_slow = df["EMA_slow"]
 
+        # Only detect crosses when ema_color is 'bull'
+        bull_condition = df["ema_color"] == "bull"
+
         # Detect upward cross: previous Close <= previous EMA_fast and current Close > current EMA_fast
-        cross_up = (close.shift(1) <= ema_fast.shift(1)) & (close > ema_fast)
+        cross_up = (close.shift(1) <= ema_fast.shift(1)) & (close > ema_fast) & bull_condition
         df.loc[in_position & cross_up, f"{prefix}_signal"] = 1
+
         # Detect downward cross: previous Close >= previous EMA_slow and current Close < current EMA_slow
-        cross_down = (close.shift(1) >= ema_slow.shift(1)) & (close < ema_slow)
+        cross_down = (close.shift(1) >= ema_slow.shift(1)) & (close < ema_slow) & bull_condition
         df.loc[in_position & cross_down, f"{prefix}_signal"] = -1
 
         # Save
@@ -289,6 +298,10 @@ class Backtest():
         self.df = df
 
     def _simulate_strategy(self):
+        """ 
+        Simulate a strategy:
+         - buy/sell on signals
+         """
         df = self.df
         str_prefix = self.str_prefix
         initial_capital = self.initial_capital
@@ -312,6 +325,56 @@ class Backtest():
                 allocated = False
             # Update portfolio value
             df.at[df.index[i], f"{str_prefix}_ret"] = cash + shares * price
+        self.df = df
+    
+    def _simulate_strategy_50pct(self):
+        """ 
+        Simulate a strategy:
+         - buy/sell on signals (with 50% of initial capital)
+         - additional buy and sell signals based on EMA crosses
+         """
+        df = self.df
+        str_prefix = self.str_prefix
+        initial_capital = self.initial_capital
+        alloc_percent = 0.5  # Allocate 50% of initial capital per signal
+        df[f"{str_prefix}_50pct_ret"] = initial_capital
+
+        cash = initial_capital
+        shares = 0.0
+        allocation_count = 0  # Number of active allocations (max 2 for 100%)
+
+        for i in range(1, len(df)):
+            signal = df[f"{str_prefix}_signal"].iloc[i]
+            price = df["Close"].iloc[i]
+
+            # Buy signal: allocate another alloc_percent if not fully allocated
+            if signal == 1 and allocation_count < int(1 / alloc_percent):
+                allocation_count += 1
+                amount_to_allocate = initial_capital * alloc_percent
+                if cash >= amount_to_allocate:
+                    shares += amount_to_allocate / price
+                    cash -= amount_to_allocate
+                else:
+                    # Allocate remaining cash if less than alloc_percent left
+                    shares += cash / price
+                    cash = 0.0
+
+            # Sell signal: de-allocate one alloc_percent if allocated
+            elif signal == -1 and allocation_count > 0:
+                allocation_count -= 1
+                amount_to_deallocate = initial_capital * alloc_percent
+                shares_to_sell = amount_to_deallocate / price
+                if shares >= shares_to_sell:
+                    shares -= shares_to_sell
+                    cash += shares_to_sell * price
+                else:
+                    # Sell all remaining shares if less than alloc_percent left
+                    cash += shares * price
+                    shares = 0.0
+
+            # Update portfolio value
+            df.at[df.index[i], f"{str_prefix}_50pct_ret"] = cash + shares * price
+
         self.df = df
 
     def _calculate_lump_sum_metrics(self):
@@ -348,7 +411,7 @@ class Backtest():
             # Win rate and number of trades
             trades = []
             entry_price = None
-            long_col = f"{strat}_long"
+            long_col = "str_def_long"
             if long_col in df.columns and "Close" in df.columns:
                 for i in range(1, len(df)):
                     if df[long_col].iloc[i] == 1 and df[long_col].iloc[i - 1] == 0:
@@ -395,7 +458,7 @@ class Backtest():
             "ROI Ratio (Strategy/Lump Sum)": "N/A"
         }])
 
-    def run(self):
+    def run_backtest(self):
         if "str_lump_sum" in self.df.columns:
             print(f"-- Lump sum column already exists for {self.ticker}. Skipping simulation.")
         else:
@@ -406,6 +469,7 @@ class Backtest():
             print(f"-- Default strategy return column already exists for {self.ticker}. Skipping simulation.")
         else:
             self._simulate_strategy()
+            self._simulate_strategy_50pct()
             self._calculate_strategy_metrics()
 
             # Save results to CSV
@@ -419,6 +483,7 @@ class Backtest():
                 else:
                     self.summary.to_csv(strategies_fpath, index=False)
                 print(f"--- Backtesting results saved.")
+
         return self.df
 
 
@@ -565,12 +630,23 @@ class Ploter:
             # Plot backtest results on a secondary Y axis
             ax = plt.gca()
             ax2 = ax.twinx()
+            ax2.set_ylabel("Initial capital + Profit & Loss")
+
+            str_colors = {
+                "str_lump_sum": "#808080",  # gray
+                "str_def": "#FCA90E",  # purple
+                "str_def_50pct": "#C96D03",  # orange
+                }
+            
+            if "str_lump_sum" in self.df.columns:
+                ax2.plot(self.df.index, self.df["str_lump_sum"], label="lump sum", color=str_colors["str_lump_sum"], linestyle='--')
             str_col = f"{strategy_prefix}_ret"
             if str_col in self.df.columns:
-                ax2.plot(self.df.index, self.df[str_col], label="Strategy Portfolio Value", color="purple", linestyle='--')
-            if "str_lump_sum" in self.df.columns:
-                ax2.plot(self.df.index, self.df["str_lump_sum"], label="Lump Sum Portfolio Value", color="gray", linestyle='--')
-            ax2.set_ylabel("Profit & Loss")
+                ax2.plot(self.df.index, self.df[str_col], label="str_def", color=str_colors["str_def"], linestyle='--')
+            str_col_50pct = f"{strategy_prefix}_50pct_ret"
+            if str_col_50pct in self.df.columns:
+                ax2.plot(self.df.index, self.df[str_col_50pct], label="str_def_50pct", color=str_colors["str_def_50pct"], linestyle='--')
+            
             # Combine legends from both axes
             lines, labels = ax.get_legend_handles_labels()
             lines2, labels2 = ax2.get_legend_handles_labels()
@@ -579,30 +655,39 @@ class Ploter:
             # Add horizontal line at the first point of the strategy portfolio value
             if str_col in self.df.columns:
                 first_val = self.df[str_col].iloc[0]
-                ax2.axhline(first_val, color="purple", linestyle=":", linewidth=1.2, alpha=0.7, label="Initial Portfolio Value")
+                ax2.axhline(first_val, color="black", linestyle=":", linewidth=1.5, alpha=0.7, label="Initial Portfolio Value")
 
             # Display strategy summary
             summary = pd.read_csv(strategies_fpath)
             summary = summary[(summary["Ticker"] == self.ticker) & (summary["Timeframe"] == self.timeframe)]
             if not summary.empty:
-                # Prepare summary text
-                s = summary.iloc[0]
-                box_text = (
-                    "Strategy: " + s['Strategy'] + "\n"
-                    f"Str. total ROI: {round(float(str(s['Total ROI']).replace('%',''))):.0f}%\n"
-                    f"Win Rate: {round(float(str(s['Win Rate']).replace('%',''))):.0f}%\n"
-                    f"Lump Sum ROI: {round(float(str(s['Lump Sum ROI']).replace('%',''))):.0f}%\n"
-                    f"Str ROI Ratio: {s['ROI Ratio (Strategy/Lump Sum)']}"
-                )
-                # Display summary box in upper left corner of the plot
-                ax2.text(
-                    0.5, 0.98, box_text,
-                    transform=ax2.transAxes,
-                    fontsize=10,
-                    verticalalignment='top',
-                    horizontalalignment='left',
-                    bbox=dict(boxstyle="round,pad=0.5", fc="white", ec="purple", alpha=0.9)
-                )
+                # Calculate the number of strategies to determine box positions
+                strategies = list(summary["Strategy"].unique())
+                n_strat = len(strategies)
+                # Set box width and spacing
+                box_width = 0.2 / max(n_strat, 1)
+                for i, strategy in enumerate(strategies):
+                    # Filter summary for the current strategy
+                    strategy_summary = summary[summary["Strategy"] == strategy]
+                    # Prepare summary text
+                    s = strategy_summary.iloc[0]
+                    box_text = (
+                        "Strategy: " + s['Strategy'] + "\n"
+                        f"Str. total ROI: {round(float(str(s['Total ROI']).replace('%',''))):.0f}%\n"
+                        f"Win Rate: {round(float(str(s['Win Rate']).replace('%',''))):.0f}%\n"
+                        f"Lump Sum ROI: {round(float(str(s['Lump Sum ROI']).replace('%',''))):.0f}%\n"
+                        f"Str ROI Ratio: {s['ROI Ratio (Strategy/Lump Sum)']}"
+                    )
+                    # Calculate x position for each box
+                    x_pos = 0.2 + i * (box_width + 0.05)
+                    ax2.text(
+                        x_pos, 0.98, box_text,
+                        transform=ax2.transAxes,
+                        fontsize=10,
+                        verticalalignment='top',
+                        horizontalalignment='left',
+                        bbox=dict(boxstyle="round,pad=0.5", fc="white", ec=str_colors[strategy], alpha=0.9)
+                    )
 
         plt.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.7)
         plt.title(f"{self.ticker} {self.timeframe}")
@@ -675,24 +760,22 @@ class Ploter:
 
 
 if __name__ == "__main__":
-
-    if False: # Fetch and save data for multiple tickers
-        asset_type = "equity"
-        tickers = ['TL0.DE']#,'MIGA.BE','1X00.BE','1NW.BE','NVD.DE','TT8.DE','1QZ.DE','M44.BE','SGM.BE']
-
+    if True: # Fetch and save data for multiple tickers
+        asset_type = "stocks"
+        ticker = None #'MIGA.BE','TL0.DE','MIGA.BE','1X00.BE','1NW.BE','NVD.DE','TT8.DE','1QZ.DE','M44.BE','SGM.BE']
         # asset_type = "crypto-USD"
         # tickers = ['SUI20947-USD'] #["BTC-USD","SOL-USD"]
 
-        yfin = YF(tickers, asset_type)
+        yfin = YF(ticker, asset_type)
         if False: # Check if tickers are valid
-            query = 'sui-usd'
+            query = 'PTX.BE'
             yfin.search_query(query)
         if True:
             yfin.fetch_and_save_data()
 
     else: # Calculate, backtest and plot specific ticker
         asset_type = 'equity' #'crypto-USD'
-        ticker = 'TL0.DE' #'SOL-USD'
+        ticker = 'MIGA.BE' #'SOL-USD'
         timeframe = '1D'
 
         # Check if indicators file exists
@@ -714,12 +797,12 @@ if __name__ == "__main__":
             # Append additional signals if needed
             calc.append_additional_signals(df, prefix="str_def_2")
 
-        if False: # Get backtest results
-            period = ("2023-01-01", "2025-06-01")
+        if True: # Get backtest results
+            period = ("2022-01-02", "2025-05-30")
             bt = Backtest(ticker, df, period, timeframe, results_csv)
-            bt.run()
+            df = bt.run_backtest()
 
         if True: # Plot results
-            date_range = ("2023-01-01", "2025-06-01")
+            date_range = ("2022-01-02", "2025-05-30")
             ploter = Ploter(ticker, df, date_range, timeframe, save_img=True)
             ploter.plot_plt()

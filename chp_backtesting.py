@@ -10,6 +10,7 @@ import matplotlib.dates as mdates
 main_dir = os.path.dirname(os.path.abspath(__file__))
 data_dir = os.path.join(main_dir, "data")
 results_dir = os.path.join(main_dir, "results")
+figs_dir = os.path.join(main_dir, "figures")
 strategies_fpath = os.path.join(results_dir, "!strategies_performance_summary.csv")
 
 class YF:
@@ -50,16 +51,10 @@ class YF:
         tickers: List of ticker symbols to fetch data for.
         filename: Path to the CSV file where data will be saved.
         """
-        print(f"Fetching data for tickers: {', '.join(tickers)}")
+        print(f"Fetching data for tickers: {', '.join(self.tickers)}")
         if os.path.exists(self.asset_data):
-            def parse_date(date_str):
-                for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%m/%d/%Y", "%Y/%m/%d"):
-                    try:
-                        return pd.to_datetime(date_str, format=fmt)
-                    except (ValueError, TypeError):
-                        continue
-                return pd.to_datetime(date_str, errors='coerce')
-            existing_data = pd.read_csv(self.asset_data, parse_dates=["Date"], index_col="Date", date_parser=parse_date)
+            existing_data = pd.read_csv(self.asset_data, index_col="Date")
+            existing_data.index = pd.to_datetime(existing_data.index, format='%d.%m.%Y', errors='coerce')
             existing_tickers = list({col.split('_')[0] for col in existing_data.columns if '_' in col})
         else:
             existing_data = pd.DataFrame()
@@ -68,8 +63,8 @@ class YF:
         end = datetime.today() - timedelta(days=1)
         start = datetime(2020, 6, 1)
 
-        for ticker in tickers:
-            ticker_cols = [f"{ticker}_Open", f"{ticker}_High", f"{ticker}_Low", f"{ticker}_Close"]
+        for ticker in self.tickers:
+            #ticker_cols = [f"{ticker}_Open", f"{ticker}_High", f"{ticker}_Low", f"{ticker}_Close"]
             if ticker in existing_tickers:
                 # Find missing dates for this ticker
                 ticker_dates = existing_data[[col for col in existing_data.columns if col.startswith(f"{ticker}_")]].dropna().index
@@ -115,8 +110,9 @@ class Calc:
         self.results_csv = results_csv
 
     def get_ticker_data(self):
+        # Read CSV with Date as string, then convert index to datetime with format '%d.%m.%Y'
         existing_data = pd.read_csv(self.asset_data, index_col="Date")
-        existing_data.index = pd.to_datetime(existing_data.index, errors='coerce')
+        existing_data.index = pd.to_datetime(existing_data.index, format='%Y-%m-%d', errors='coerce')
         # Filter columns for the specified ticker
         ticker_columns = [col for col in existing_data.columns if col.startswith(f"{self.ticker}_")]
         if not ticker_columns:
@@ -188,38 +184,71 @@ class Calc:
         self.df = df
         return df
 
-    def get_default_signals(self):
+    def get_default_signals(self, prefix="str_def"):
         df = self.df
         # Skip if columns that start with "str_def" already exist
-        if any(col.startswith("str_def") for col in df.columns):
+        if any(col.startswith(prefix) for col in df.columns):
             print(f"-- Signals for {self.ticker} already exist in DataFrame. Skipping calculation.")
             return df
 
-        df["str_def_long"] = 0
-        df["str_def_signal"] = 0
+        df[f"{prefix}_long"] = 0
+        df[f"{prefix}_signal"] = 0
 
         # Buy signal: when bull turns True (from not bull)
         buy_signal = (df["bull"] & ~df["bull"].shift(1).astype(bool).fillna(False))
         # Sell signal: when bear turns True (from not bear)
         sell_signal = (df["bear"] & ~df["bear"].shift(1).astype(bool).fillna(False))
 
-        df.loc[buy_signal, "str_def_signal"] = 1   # Buy
-        df.loc[sell_signal, "str_def_signal"] = -1 # Sell
+        df.loc[buy_signal, f"{prefix}_signal"] = 1   # Buy
+        df.loc[sell_signal, f"{prefix}_signal"] = -1 # Sell
 
         # Forward fill long position: in position after buy, out after sell
         in_position = False
         for i in range(len(df)):
-            if df["str_def_signal"].iloc[i] == 1:
+            if df[f"{prefix}_signal"].iloc[i] == 1:
                 in_position = True
-            elif df["str_def_signal"].iloc[i] == -1:
+            elif df[f"{prefix}_signal"].iloc[i] == -1:
                 in_position = False
-            df.at[df.index[i], "str_def_long"] = int(in_position)
+            df.at[df.index[i], f"{prefix}_long"] = int(in_position)
         
-        # Save if needed
+        # Save
         df.to_csv(self.results_csv, index=True)
-        print(f"--- Signals for {self.ticker} with {self.timeframe} saved.")
+        print(f"--- Signals for {self.ticker} with {self.timeframe} timeframe saved.")
         self.df = df
         return df
+    
+    def append_additional_signals(self, df, prefix="str_def_2"):
+        """
+        Append additional signals to the DataFrame.
+        This method is a placeholder for future signal calculations.
+        """
+        # Check if prefix already exists
+        if any(col.startswith(prefix) for col in df.columns):
+            print(f"-- Additional signals with prefix '{prefix}' already exist in DataFrame. Skipping calculation.")
+            return df
+
+        # Placeholder for additional signal logic
+        df[f"{prefix}_signal"] = 0
+
+        # If in position (str_def_long == 1), signal a buy when Close crosses above EMA_fast
+        df[f"{prefix}_buy_cross"] = 0
+        df[f"{prefix}_sell_cross"] = 0
+        in_position = df["str_def_long"] == 1
+        close = df["Close"]
+        ema_fast = df["EMA_fast"]
+        ema_slow = df["EMA_slow"]
+
+        # Detect upward cross: previous Close <= previous EMA_fast and current Close > current EMA_fast
+        cross_up = (close.shift(1) <= ema_fast.shift(1)) & (close > ema_fast)
+        df.loc[in_position & cross_up, f"{prefix}_signal"] = 1
+        # Detect downward cross: previous Close >= previous EMA_slow and current Close < current EMA_slow
+        cross_down = (close.shift(1) >= ema_slow.shift(1)) & (close < ema_slow)
+        df.loc[in_position & cross_down, f"{prefix}_signal"] = -1
+
+        # Save
+        df.to_csv(self.results_csv, index=True)
+        print(f"--- Additional signals for {self.ticker} with {self.timeframe} timeframe saved.")
+        self.df = df
 
 
 class Backtest():
@@ -230,6 +259,8 @@ class Backtest():
         self.timeframe = timeframe
         self.results_csv = results_csv
         self.summary = None
+        self.initial_capital = 1000.0
+        self.str_prefix = "str_def"
 
         # Filter DataFrame by period if provided
         if self.period is not None:
@@ -365,35 +396,39 @@ class Backtest():
         }])
 
     def run(self):
-        self.initial_capital = 1000.0
-        self._simulate_lump_sum()
-        self._calculate_lump_sum_metrics()
+        if "str_lump_sum" in self.df.columns:
+            print(f"-- Lump sum column already exists for {self.ticker}. Skipping simulation.")
+        else:
+            self._simulate_lump_sum()
+            self._calculate_lump_sum_metrics()
 
-        self.str_prefix = "str_def"
-        self._simulate_strategy()
-        self._calculate_strategy_metrics()
-
-        # Save results to CSV
-        if self.results_csv:
-            self.df.to_csv(self.results_csv, index=True)
-            # Calculate performance metrics
+        if "str_def_ret" in self.df.columns:
+            print(f"-- Default strategy return column already exists for {self.ticker}. Skipping simulation.")
+        else:
+            self._simulate_strategy()
             self._calculate_strategy_metrics()
-            # Append to existing summary CSV if it exists, else create new
-            if os.path.exists(strategies_fpath):
-                existing = pd.read_csv(strategies_fpath)
-                combined = pd.concat([existing, self.summary], ignore_index=True)
-                combined.to_csv(strategies_fpath, index=False)
-            else:
-                self.summary.to_csv(strategies_fpath, index=False)
-            print(f"--- Backtesting results saved.")
+
+            # Save results to CSV
+            if self.results_csv:
+                self.df.to_csv(self.results_csv, index=True)
+                # Append to existing summary CSV if it exists, else create new
+                if os.path.exists(strategies_fpath):
+                    existing = pd.read_csv(strategies_fpath)
+                    combined = pd.concat([existing, self.summary], ignore_index=True)
+                    combined.to_csv(strategies_fpath, index=False)
+                else:
+                    self.summary.to_csv(strategies_fpath, index=False)
+                print(f"--- Backtesting results saved.")
         return self.df
 
 
 class Ploter:
-    def __init__(self, ticker, df, period=None):
+    def __init__(self, ticker, df, period=None, timeframe='1D', save_img=False):
         self.ticker = ticker
         self.df = df
         self.period = period
+        self.timeframe = timeframe
+        self.save_img = save_img
 
         # If date_range is provided, filter the DataFrame
         if period is not None:
@@ -408,7 +443,7 @@ class Ploter:
             'light_blue': '#D1CAF4',
             'dark_gray': '#4F4F4E',
             'light_gray': '#D9D9D8',
-        }
+            }
     
     def plot_plt(self):
         """ Plotting with matplotlib using ema_color for segment coloring """
@@ -501,6 +536,31 @@ class Ploter:
                 )
         _plot_signals()
 
+        def _plot_add_signals(prefix="str_def_2"):
+            # Plot additional buy/sell signals
+            buy_signals = self.df[self.df[f"{prefix}_signal"] == 1]
+            sell_signals = self.df[self.df[f"{prefix}_signal"] == -1]
+
+            plt.scatter(
+                mdates.date2num(buy_signals.index),
+                buy_signals["Close"],
+                marker="^",
+                color="green",
+                s=50,
+                alpha=0.5,
+                label=f"{prefix} Buy Signal"
+            )
+            plt.scatter(
+                mdates.date2num(sell_signals.index),
+                sell_signals["Close"],
+                marker="v",
+                color="red",
+                s=50,
+                alpha=0.5,
+                label=f"{prefix} Sell Signal"
+            )
+        _plot_add_signals()
+
         def _plot_backtest_results(strategy_prefix="str_def"):
             # Plot backtest results on a secondary Y axis
             ax = plt.gca()
@@ -516,15 +576,48 @@ class Ploter:
             lines2, labels2 = ax2.get_legend_handles_labels()
             ax2.legend(lines + lines2, labels + labels2, loc="upper left")
 
+            # Add horizontal line at the first point of the strategy portfolio value
+            if str_col in self.df.columns:
+                first_val = self.df[str_col].iloc[0]
+                ax2.axhline(first_val, color="purple", linestyle=":", linewidth=1.2, alpha=0.7, label="Initial Portfolio Value")
+
+            # Display strategy summary
+            summary = pd.read_csv(strategies_fpath)
+            summary = summary[(summary["Ticker"] == self.ticker) & (summary["Timeframe"] == self.timeframe)]
+            if not summary.empty:
+                # Prepare summary text
+                s = summary.iloc[0]
+                box_text = (
+                    "Strategy: " + s['Strategy'] + "\n"
+                    f"Str. total ROI: {round(float(str(s['Total ROI']).replace('%',''))):.0f}%\n"
+                    f"Win Rate: {round(float(str(s['Win Rate']).replace('%',''))):.0f}%\n"
+                    f"Lump Sum ROI: {round(float(str(s['Lump Sum ROI']).replace('%',''))):.0f}%\n"
+                    f"Str ROI Ratio: {s['ROI Ratio (Strategy/Lump Sum)']}"
+                )
+                # Display summary box in upper left corner of the plot
+                ax2.text(
+                    0.5, 0.98, box_text,
+                    transform=ax2.transAxes,
+                    fontsize=10,
+                    verticalalignment='top',
+                    horizontalalignment='left',
+                    bbox=dict(boxstyle="round,pad=0.5", fc="white", ec="purple", alpha=0.9)
+                )
+
         plt.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.7)
-        plt.title(f"{self.ticker} Price and EMA Trend Coloring")
+        plt.title(f"{self.ticker} {self.timeframe}")
         plt.xlabel("Date")
         plt.ylabel("Price")
-        plt.legend()
+        #plt.legend()
 
         _plot_backtest_results()
 
         plt.tight_layout()
+
+        if self.save_img:
+            img_path = os.path.join(figs_dir, f"{self.ticker}_{self.timeframe}_plot.png")
+            plt.savefig(img_path, dpi=150, bbox_inches='tight')
+            print(f"Plot saved to {img_path}")
         plt.show()
 
     def plot_mpl(self):
@@ -584,12 +677,11 @@ class Ploter:
 if __name__ == "__main__":
 
     if False: # Fetch and save data for multiple tickers
+        asset_type = "equity"
+        tickers = ['TL0.DE']#,'MIGA.BE','1X00.BE','1NW.BE','NVD.DE','TT8.DE','1QZ.DE','M44.BE','SGM.BE']
 
-        #asset_type = "equity"
-        #tickers = ['TL0.DE','MIGA.BE','1X00.BE','1NW.BE','NVD.DE','TT8.DE','1QZ.DE','M44.BE','SGM.BE']
-
-        asset_type = "crypto-USD"
-        tickers = ['SUI20947-USD'] #["BTC-USD","SOL-USD"]
+        # asset_type = "crypto-USD"
+        # tickers = ['SUI20947-USD'] #["BTC-USD","SOL-USD"]
 
         yfin = YF(tickers, asset_type)
         if False: # Check if tickers are valid
@@ -599,8 +691,8 @@ if __name__ == "__main__":
             yfin.fetch_and_save_data()
 
     else: # Calculate, backtest and plot specific ticker
-        asset_type = 'crypto-USD'
-        ticker = 'SOL-USD'
+        asset_type = 'equity' #'crypto-USD'
+        ticker = 'TL0.DE' #'SOL-USD'
         timeframe = '1D'
 
         # Check if indicators file exists
@@ -608,8 +700,10 @@ if __name__ == "__main__":
         results_csv = os.path.join(results_dir, f"{ticker}_{timeframe}_data_indicators_signals.csv")
         if not overwrite and os.path.exists(results_csv):
             print(f"--- Indicators and signals for {ticker} already exist. Skipping calculation.")
-            df = pd.read_csv(results_csv, parse_dates=["Date"], index_col="Date")
+            df = pd.read_csv(results_csv, index_col="Date")
+            df.index = pd.to_datetime(df.index, format='%Y-%m-%d', errors='coerce')
         else:
+            print(f"--- Calculating indicators and signals for {ticker} with {timeframe} timeframe.")
             calc = Calc(ticker, asset_type, timeframe, results_csv)
             # Load ticker data
             df = calc.get_ticker_data()
@@ -617,13 +711,15 @@ if __name__ == "__main__":
             df = calc.get_default_indicators()
             # Get trading signals
             df = calc.get_default_signals()
+            # Append additional signals if needed
+            calc.append_additional_signals(df, prefix="str_def_2")
 
-        if True: # Get backtest results
+        if False: # Get backtest results
             period = ("2023-01-01", "2025-06-01")
             bt = Backtest(ticker, df, period, timeframe, results_csv)
             bt.run()
 
-        if False: # Plot results
+        if True: # Plot results
             date_range = ("2023-01-01", "2025-06-01")
-            ploter = Ploter(ticker, df, period=date_range)
+            ploter = Ploter(ticker, df, date_range, timeframe, save_img=True)
             ploter.plot_plt()

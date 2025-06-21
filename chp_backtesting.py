@@ -336,6 +336,7 @@ class Backtest():
                 shares = 0.0
                 allocated = False
             # Update portfolio value
+            df.at[df.index[i], f"{str_prefix}_shares"] = shares
             df.at[df.index[i], f"{str_prefix}_ret"] = cash + shares * price
         self.df = df
     
@@ -361,7 +362,9 @@ class Backtest():
             # Buy signal: allocate another alloc_percent if not fully allocated
             if signal == 1 and allocation_count < int(1 / alloc_percent):
                 allocation_count += 1
-                amount_to_allocate = initial_capital * alloc_percent
+                # Calculate amount_to_allocate as alloc_percent of current portfolio value (cash + shares*price)
+                current_portfolio_value = cash + shares * price
+                amount_to_allocate = alloc_percent * current_portfolio_value
                 if cash >= amount_to_allocate:
                     shares += amount_to_allocate / price
                     cash -= amount_to_allocate
@@ -373,7 +376,9 @@ class Backtest():
             # Sell signal: de-allocate one alloc_percent if allocated
             elif signal == -1 and allocation_count > 0:
                 allocation_count -= 1
-                amount_to_deallocate = initial_capital * alloc_percent
+                # Calculate amount_to_deallocate as alloc_percent of current portfolio value (cash + shares*price)
+                current_portfolio_value = cash + shares * price
+                amount_to_deallocate = alloc_percent * current_portfolio_value
                 shares_to_sell = amount_to_deallocate / price
                 if shares >= shares_to_sell:
                     shares -= shares_to_sell
@@ -384,21 +389,21 @@ class Backtest():
                     shares = 0.0
 
             # Update portfolio value
+            df.at[df.index[i], f"{str_prefix}_50pct_shares"] = shares
             df.at[df.index[i], f"{str_prefix}_50pct_ret"] = cash + shares * price
 
         self.df = df
-
-    def _simulate_strategy_50pct_sec(self):
+    
+    def _simulate_strategy_50pct_sell_all(self):
         """ 
         Simulate a strategy:
          - buy/sell on signals (with 50% of initial capital)
-         - additional buy and sell signals based on EMA crosses
          """
         df = self.df
         str_prefix = self.str_prefix
         initial_capital = self.initial_capital
         alloc_percent = 0.5  # Allocate 50% of initial capital per signal
-        df[f"{str_prefix}_50pct_ret"] = initial_capital
+        df[f"{str_prefix}_50pct_sell_all_ret"] = initial_capital
 
         cash = initial_capital
         shares = 0.0
@@ -411,7 +416,9 @@ class Backtest():
             # Buy signal: allocate another alloc_percent if not fully allocated
             if signal == 1 and allocation_count < int(1 / alloc_percent):
                 allocation_count += 1
-                amount_to_allocate = initial_capital * alloc_percent
+                # Calculate amount_to_allocate as alloc_percent of current portfolio value (cash + shares*price)
+                current_portfolio_value = cash + shares * price
+                amount_to_allocate = alloc_percent * current_portfolio_value
                 if cash >= amount_to_allocate:
                     shares += amount_to_allocate / price
                     cash -= amount_to_allocate
@@ -420,21 +427,92 @@ class Backtest():
                     shares += cash / price
                     cash = 0.0
 
-            # Sell signal: de-allocate one alloc_percent if allocated
+            # Sell signal: sell all available shares at this point
+            elif signal == -1 and shares > 0:
+                cash += shares * price
+                shares = 0.0
+                allocation_count = 0
+
+            # Update portfolio value
+            df.at[df.index[i], f"{str_prefix}_50pct_sell_all_shares"] = shares
+            df.at[df.index[i], f"{str_prefix}_50pct_sell_all_ret"] = cash + shares * price
+
+        self.df = df
+
+    def _simulate_strategy_50pct_sec(self):
+        """ 
+        Simulate a strategy:
+         - buy/sell on signals (with 50% of initial capital)
+         - additional buy and sell signals based on EMA crosses
+         """
+        df = self.df
+        str_prefix = self.str_prefix
+        initial_capital = self.initial_capital
+        alloc_percent = 0.5  # Primary signal allocation (50%)
+        sec_alloc_percent = 0.25  # Secondary signal allocation (25%)
+        df[f"{str_prefix}_50pct_sec_ret"] = initial_capital
+
+        cash = initial_capital
+        shares = 0.0
+        allocation_count = 0  # Number of 50% allocations (max 2 for 100%)
+        sec_allocation = False  # Track if 25% is allocated via secondary signal
+
+        for i in range(1, len(df)):
+            signal = df[f"{str_prefix}_signal"].iloc[i]
+            sec_signal = df[f"{str_prefix}_2_signal"].iloc[i] if f"{str_prefix}_2_signal" in df.columns else 0
+            price = df["Close"].iloc[i]
+            current_portfolio_value = cash + shares * price
+
+            # Primary buy: allocate another 50% if not fully allocated
+            if signal == 1 and allocation_count < int(1 / alloc_percent):
+                allocation_count += 1
+                amount_to_allocate = alloc_percent * current_portfolio_value if current_portfolio_value > 0 else 0
+                shares_to_buy = amount_to_allocate / price if price > 0 else 0
+                if cash >= amount_to_allocate and amount_to_allocate > 0:
+                    shares += shares_to_buy
+                    cash -= amount_to_allocate
+                else:
+                    shares += cash / price if price > 0 else 0
+                    cash = 0.0
+
+            # Primary sell: de-allocate one 50% if allocated
             elif signal == -1 and allocation_count > 0:
                 allocation_count -= 1
-                amount_to_deallocate = initial_capital * alloc_percent
-                shares_to_sell = amount_to_deallocate / price
-                if shares >= shares_to_sell:
+                shares_to_sell = alloc_percent * current_portfolio_value / price if price > 0 else 0
+                if shares >= shares_to_sell and shares_to_sell > 0:
                     shares -= shares_to_sell
                     cash += shares_to_sell * price
                 else:
-                    # Sell all remaining shares if less than alloc_percent left
                     cash += shares * price
                     shares = 0.0
 
+            # Secondary buy: allocate 25% of remaining portfolio value if not already allocated and cash available
+            if sec_signal == 1 and not sec_allocation and cash > 0:
+                amount_to_allocate = sec_alloc_percent * current_portfolio_value if current_portfolio_value > 0 else 0
+                shares_to_buy = amount_to_allocate / price if price > 0 else 0
+                if cash >= amount_to_allocate and amount_to_allocate > 0:
+                    shares += shares_to_buy
+                    cash -= amount_to_allocate
+                    sec_allocation = True
+                else:
+                    shares += cash / price if price > 0 else 0
+                    cash = 0.0
+                    sec_allocation = True
+
+            # Secondary sell: de-allocate 25% of current portfolio value (or all remaining shares if less)
+            elif sec_signal == -1:
+                shares_to_sell = sec_alloc_percent * current_portfolio_value / price if price > 0 else 0
+                if shares >= shares_to_sell and shares_to_sell > 0:
+                    shares -= shares_to_sell
+                    cash += shares_to_sell * price
+                else:
+                    cash += shares * price
+                    shares = 0.0
+                sec_allocation = False
+
             # Update portfolio value
-            df.at[df.index[i], f"{str_prefix}_50pct_ret"] = cash + shares * price
+            df.at[df.index[i], f"{str_prefix}_50pct_sec_shares"] = shares
+            df.at[df.index[i], f"{str_prefix}_50pct_sec_ret"] = cash + shares * price
 
         self.df = df
 
@@ -464,6 +542,8 @@ class Backtest():
         description = {
             "str_def": "Buy/Sell on Prim. signals",
             "str_def_50pct": "Buy/Sell on Prim. signals 50% alloc.",
+            "str_def_50pct_sell_all": "str_def_50pct but sell all on Sell",
+            "str_def_50pct_sec": "str_def_50pct + Sec. signals 25%",
         }
 
         for col in ret_cols:
@@ -474,15 +554,20 @@ class Backtest():
             years = days / 365.25 if days > 0 else np.nan
             cagr = (portfolio.iloc[-1] / portfolio.iloc[0]) ** (1 / years) - 1 if years > 0 else np.nan
 
-            # Win rate and number of trades
+            # Win rate and number of trades based on share count changes
             trades = []
             entry_price = None
-            long_col = "str_def_long"
-            if long_col in df.columns and "Close" in df.columns:
+            shares_col = f"{strat}_shares" if f"{strat}_shares" in df.columns else None
+            if shares_col and "Close" in df.columns:
+                shares = df[shares_col].fillna(0)
+                num_buys = 0
                 for i in range(1, len(df)):
-                    if df[long_col].iloc[i] == 1 and df[long_col].iloc[i - 1] == 0:
+                    # Entry: shares increase (from 0 or any lower value to higher value)
+                    if shares.iloc[i] > shares.iloc[i - 1]:
                         entry_price = df["Close"].iloc[i]
-                    if df[long_col].iloc[i] == 0 and df[long_col].iloc[i - 1] == 1 and entry_price is not None:
+                        num_buys += 1
+                    # Exit: shares decrease (from higher value to lower value)
+                    if shares.iloc[i] < shares.iloc[i - 1] and entry_price is not None:
                         exit_price = df["Close"].iloc[i]
                         trades.append(exit_price / entry_price - 1)
                         entry_price = None
@@ -504,11 +589,12 @@ class Backtest():
                 "CAGR": f"{cagr * 100:.0f}%" if years == years else "N/A",
                 "Win Rate": f"{win_rate * 100:.0f}%" if not np.isnan(win_rate) else "N/A",
                 "Number of Trades": num_trades if not np.isnan(num_trades) else "N/A",
+                "Number of Buys": num_buys if not np.isnan(num_buys) else "N/A",
                 "Lump Sum ROI": f"{lump_sum_roi * 100:.0f}%" if not np.isnan(lump_sum_roi) else "N/A",
                 "Lump Sum CAGR": f"{lump_sum_cagr * 100:.0f}%" if not np.isnan(lump_sum_cagr) else "N/A",
                 "ROI Ratio (Strategy/Lump Sum)": f"{roi_ratio:.2f}" if not np.isnan(roi_ratio) else "N/A",
                 "Description": description.get(strat, "N/A")
-            }
+                }
             summaries.append(metrics)
 
         self.summary = pd.DataFrame(summaries) if summaries else pd.DataFrame([{
@@ -520,6 +606,7 @@ class Backtest():
             "CAGR": "N/A",
             "Win Rate": "N/A",
             "Number of Trades": "N/A",
+            "Number of Buys": "N/A",
             "Lump Sum ROI": "N/A",
             "Lump Sum CAGR": "N/A",
             "ROI Ratio (Strategy/Lump Sum)": "N/A",
@@ -539,6 +626,8 @@ class Backtest():
         else:
             self._simulate_strategy()
             self._simulate_strategy_50pct()
+            self._simulate_strategy_50pct_sell_all()
+            self._simulate_strategy_50pct_sec()
             self._calculate_strategy_metrics()
 
             # Save results to CSV
@@ -631,27 +720,24 @@ class Ploter:
                     seg_start = i - 1
                     prev_color = color
 
-        def _plot_backtest_results(strategy_prefix="str_def"):
+        def _plot_backtest_results():
             # Plot backtest results on a secondary Y axis
             str_colors = {
-                "str_lump_sum": "#808080",  # gray
-                "str_def": "#FCA90E",  # purple
-                "str_def_50pct": "#C96D03",  # orange
+                "str_lump_sum": "#808080",
+                "str_def_ret": "#FCA90E",
+                "str_def_50pct_ret": "#C96D03",
+                "str_def_50pct_sec_ret": "#FD6F4F",
+                "str_def_50pct_sell_all_ret": "#FC0000",
             }
             
-            if "str_lump_sum" in self.df.columns:
-                ax2.plot(self.df.index, self.df["str_lump_sum"], label="lump sum", color=str_colors["str_lump_sum"], linestyle='--')
-            str_col = f"{strategy_prefix}_ret"
-            if str_col in self.df.columns:
-                ax2.plot(self.df.index, self.df[str_col], label="str_def", color=str_colors["str_def"], linestyle='--')
-            str_col_50pct = f"{strategy_prefix}_50pct_ret"
-            if str_col_50pct in self.df.columns:
-                ax2.plot(self.df.index, self.df[str_col_50pct], label="str_def_50pct", color=str_colors["str_def_50pct"], linestyle='--')
+            # Plot all strategy return columns dynamically
+            for strat_key, color in str_colors.items():
+                if strat_key in self.df.columns:
+                    ax2.plot(self.df.index, self.df[strat_key], label=strat_key, color=color, linestyle='--')
             
             # Add horizontal line at the first point of the strategy portfolio value
-            if str_col in self.df.columns:
-                first_val = self.df[str_col].iloc[0]
-                ax2.axhline(first_val, color="black", linestyle=":", linewidth=1.5, alpha=0.7, label="Initial Portfolio Value")
+            first_val = self.df["str_lump_sum"].iloc[0]
+            ax2.axhline(first_val, color="black", linestyle="-", linewidth=0.5, alpha=0.7, label="Initial Portfolio Value")
 
             # Display strategy summary
             summary = pd.read_csv(strategies_fpath)

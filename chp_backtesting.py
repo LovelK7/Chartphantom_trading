@@ -24,7 +24,7 @@ class YF:
         if type(tickers) is str:
             self.tickers = [tickers]
         else:
-            self.tickers = pd.read_csv(tickers_fpath).get("tickers", tickers).tolist()[:7]
+            self.tickers = pd.read_csv(tickers_fpath).get("tickers", tickers).tolist()
 
     def search_query(self, query):
         """
@@ -99,6 +99,7 @@ class YF:
                         print(f"Updated data for {ticker} saved to {os.path.basename(self.asset_data)}.")
                     else:
                         print(f"No new data found for {ticker}.")
+
 
 class Calc:
     def __init__(self, ticker, asset_type, timeframe='1D', results_csv=None):
@@ -222,7 +223,7 @@ class Calc:
         self.df = df
         return df
     
-    def append_additional_signals(self, df, prefix="str_def_2"):
+    def get_additional_signals(self, df, prefix="str_def_2"):
         """
         Append additional signals to the DataFrame.
         This method is a placeholder for future signal calculations.
@@ -246,12 +247,23 @@ class Calc:
         # Only detect crosses when ema_color is 'bull'
         bull_condition = df["ema_color"] == "bull"
 
-        # Detect upward cross: previous Close <= previous EMA_fast and current Close > current EMA_fast
-        cross_up = (close.shift(1) <= ema_fast.shift(1)) & (close > ema_fast) & bull_condition
+        # Set the percentage threshold (e.g., 1% = 0.01)
+        pct_threshold = 0.05  # Change this value as needed
+
+        # Detect upward cross: previous Close <= previous EMA_fast and current Close > (1 + pct_threshold) * EMA_fast
+        cross_up = (
+            (close.shift(1) <= ema_fast.shift(1)) &
+            (close > (1 + pct_threshold) * ema_fast) &
+            bull_condition
+        )
         df.loc[in_position & cross_up, f"{prefix}_signal"] = 1
 
-        # Detect downward cross: previous Close >= previous EMA_slow and current Close < current EMA_slow
-        cross_down = (close.shift(1) >= ema_slow.shift(1)) & (close < ema_slow) & bull_condition
+        # Detect downward cross: previous Close >= ema_slow.shift(1) and current Close < (1 - pct_threshold) * EMA_slow
+        cross_down = (
+            (close.shift(1) >= ema_slow.shift(1)) &
+            (close < (1 - pct_threshold) * ema_slow) &
+            bull_condition
+        )
         df.loc[in_position & cross_down, f"{prefix}_signal"] = -1
 
         # Save
@@ -331,6 +343,55 @@ class Backtest():
         """ 
         Simulate a strategy:
          - buy/sell on signals (with 50% of initial capital)
+         """
+        df = self.df
+        str_prefix = self.str_prefix
+        initial_capital = self.initial_capital
+        alloc_percent = 0.5  # Allocate 50% of initial capital per signal
+        df[f"{str_prefix}_50pct_ret"] = initial_capital
+
+        cash = initial_capital
+        shares = 0.0
+        allocation_count = 0  # Number of active allocations (max 2 for 100%)
+
+        for i in range(1, len(df)):
+            signal = df[f"{str_prefix}_signal"].iloc[i]
+            price = df["Close"].iloc[i]
+
+            # Buy signal: allocate another alloc_percent if not fully allocated
+            if signal == 1 and allocation_count < int(1 / alloc_percent):
+                allocation_count += 1
+                amount_to_allocate = initial_capital * alloc_percent
+                if cash >= amount_to_allocate:
+                    shares += amount_to_allocate / price
+                    cash -= amount_to_allocate
+                else:
+                    # Allocate remaining cash if less than alloc_percent left
+                    shares += cash / price
+                    cash = 0.0
+
+            # Sell signal: de-allocate one alloc_percent if allocated
+            elif signal == -1 and allocation_count > 0:
+                allocation_count -= 1
+                amount_to_deallocate = initial_capital * alloc_percent
+                shares_to_sell = amount_to_deallocate / price
+                if shares >= shares_to_sell:
+                    shares -= shares_to_sell
+                    cash += shares_to_sell * price
+                else:
+                    # Sell all remaining shares if less than alloc_percent left
+                    cash += shares * price
+                    shares = 0.0
+
+            # Update portfolio value
+            df.at[df.index[i], f"{str_prefix}_50pct_ret"] = cash + shares * price
+
+        self.df = df
+
+    def _simulate_strategy_50pct_sec(self):
+        """ 
+        Simulate a strategy:
+         - buy/sell on signals (with 50% of initial capital)
          - additional buy and sell signals based on EMA crosses
          """
         df = self.df
@@ -377,6 +438,7 @@ class Backtest():
 
         self.df = df
 
+
     def _calculate_lump_sum_metrics(self):
         df = self.df
         lump_portfolio = df["str_lump_sum"].copy().ffill()
@@ -399,6 +461,10 @@ class Backtest():
         lump_sum_roi = self.lump_sum_metrics.get("Lump Sum ROI", np.nan)
         lump_sum_cagr = self.lump_sum_metrics.get("Lump Sum CAGR", np.nan)
         backtest_period = self.lump_sum_metrics.get("Backtest Period", "N/A")
+        description = {
+            "str_def": "Buy/Sell on Prim. signals",
+            "str_def_50pct": "Buy/Sell on Prim. signals 50% alloc.",
+        }
 
         for col in ret_cols:
             strat = col.replace('_ret', '')
@@ -434,13 +500,14 @@ class Backtest():
                 "Strategy": strat,
                 "Backtest Period": backtest_period,
                 "Timeframe": self.timeframe,
-                "Total ROI": f"{total_return * 100:.2f}%",
-                "CAGR": f"{cagr * 100:.2f}%" if years == years else "N/A",
-                "Win Rate": f"{win_rate * 100:.2f}%" if not np.isnan(win_rate) else "N/A",
+                "Total ROI": f"{total_return * 100:.0f}%",
+                "CAGR": f"{cagr * 100:.0f}%" if years == years else "N/A",
+                "Win Rate": f"{win_rate * 100:.0f}%" if not np.isnan(win_rate) else "N/A",
                 "Number of Trades": num_trades if not np.isnan(num_trades) else "N/A",
-                "Lump Sum ROI": f"{lump_sum_roi * 100:.2f}%" if not np.isnan(lump_sum_roi) else "N/A",
-                "Lump Sum CAGR": f"{lump_sum_cagr * 100:.2f}%" if not np.isnan(lump_sum_cagr) else "N/A",
-                "ROI Ratio (Strategy/Lump Sum)": f"{roi_ratio:.2f}" if not np.isnan(roi_ratio) else "N/A"
+                "Lump Sum ROI": f"{lump_sum_roi * 100:.0f}%" if not np.isnan(lump_sum_roi) else "N/A",
+                "Lump Sum CAGR": f"{lump_sum_cagr * 100:.0f}%" if not np.isnan(lump_sum_cagr) else "N/A",
+                "ROI Ratio (Strategy/Lump Sum)": f"{roi_ratio:.2f}" if not np.isnan(roi_ratio) else "N/A",
+                "Description": description.get(strat, "N/A")
             }
             summaries.append(metrics)
 
@@ -455,8 +522,10 @@ class Backtest():
             "Number of Trades": "N/A",
             "Lump Sum ROI": "N/A",
             "Lump Sum CAGR": "N/A",
-            "ROI Ratio (Strategy/Lump Sum)": "N/A"
+            "ROI Ratio (Strategy/Lump Sum)": "N/A",
+            "Description": "N/A",
         }])
+
 
     def run_backtest(self):
         if "str_lump_sum" in self.df.columns:
@@ -512,15 +581,6 @@ class Ploter:
     
     def plot_plt(self):
         """ Plotting with matplotlib using ema_color for segment coloring """
-
-        plt.figure(figsize=(14, 7))
-        plt.plot(self.df.index, self.df["Close"], label="Close Price", color="black")
-
-        ema_fast = self.df["EMA_fast"]
-        ema_slow = self.df["EMA_slow"]
-        ema_color = self.df["ema_color"]
-        x = mdates.date2num(self.df.index.to_pydatetime())
-
         # Map ema_color to color_dict
         color_map = {
             "bull": self.color_dict['dark_gold'],
@@ -533,8 +593,6 @@ class Ploter:
             "neutral": self.color_dict['light_gray'],
         }
 
-
-        # Plot EMA_fast and EMA_slow with coloring by ema_color
         def _plot_colored_segments(x, y, color_series, label_prefix):
             prev_color = None
             seg_start = 0
@@ -552,10 +610,7 @@ class Ploter:
                         )
                     seg_start = i - 1
                     prev_color = color
-        _plot_colored_segments(x, ema_fast.values, ema_color, "EMA Fast")
-        _plot_colored_segments(x, ema_slow.values, ema_color, "EMA Slow")
 
-        # Fill between EMA_fast and EMA_slow with colors based on ema_color
         def _fill_between_emas(x, ema_fast, ema_slow, ema_color, fill_color_map):
             prev_color = None
             seg_start = 0
@@ -575,68 +630,14 @@ class Ploter:
                         )
                     seg_start = i - 1
                     prev_color = color
-        _fill_between_emas(x, ema_fast.values, ema_slow.values, ema_color, fill_color_map)
-        
-        # Plot signals
-        def _plot_signals():
-            # Plot buy (green up) and sell (red down) arrows for signals
-            buy_signals = self.df[self.df["str_def_signal"] == 1]
-            sell_signals = self.df[self.df["str_def_signal"] == -1]
-
-            plt.scatter(
-                    mdates.date2num(buy_signals.index),
-                    buy_signals["Close"],
-                    marker="^",
-                    color="green",
-                    s=100,
-                    label="Buy Signal"
-                )
-            plt.scatter(
-                    mdates.date2num(sell_signals.index),
-                    sell_signals["Close"],
-                    marker="v",
-                    color="red",
-                    s=100,
-                    label="Sell Signal"
-                )
-        _plot_signals()
-
-        def _plot_add_signals(prefix="str_def_2"):
-            # Plot additional buy/sell signals
-            buy_signals = self.df[self.df[f"{prefix}_signal"] == 1]
-            sell_signals = self.df[self.df[f"{prefix}_signal"] == -1]
-
-            plt.scatter(
-                mdates.date2num(buy_signals.index),
-                buy_signals["Close"],
-                marker="^",
-                color="green",
-                s=50,
-                alpha=0.5,
-                label=f"{prefix} Buy Signal"
-            )
-            plt.scatter(
-                mdates.date2num(sell_signals.index),
-                sell_signals["Close"],
-                marker="v",
-                color="red",
-                s=50,
-                alpha=0.5,
-                label=f"{prefix} Sell Signal"
-            )
-        _plot_add_signals()
 
         def _plot_backtest_results(strategy_prefix="str_def"):
             # Plot backtest results on a secondary Y axis
-            ax = plt.gca()
-            ax2 = ax.twinx()
-            ax2.set_ylabel("Initial capital + Profit & Loss")
-
             str_colors = {
                 "str_lump_sum": "#808080",  # gray
                 "str_def": "#FCA90E",  # purple
                 "str_def_50pct": "#C96D03",  # orange
-                }
+            }
             
             if "str_lump_sum" in self.df.columns:
                 ax2.plot(self.df.index, self.df["str_lump_sum"], label="lump sum", color=str_colors["str_lump_sum"], linestyle='--')
@@ -647,11 +648,6 @@ class Ploter:
             if str_col_50pct in self.df.columns:
                 ax2.plot(self.df.index, self.df[str_col_50pct], label="str_def_50pct", color=str_colors["str_def_50pct"], linestyle='--')
             
-            # Combine legends from both axes
-            lines, labels = ax.get_legend_handles_labels()
-            lines2, labels2 = ax2.get_legend_handles_labels()
-            ax2.legend(lines + lines2, labels + labels2, loc="upper left")
-
             # Add horizontal line at the first point of the strategy portfolio value
             if str_col in self.df.columns:
                 first_val = self.df[str_col].iloc[0]
@@ -663,40 +659,125 @@ class Ploter:
             if not summary.empty:
                 # Calculate the number of strategies to determine box positions
                 strategies = list(summary["Strategy"].unique())
-                n_strat = len(strategies)
-                # Set box width and spacing
-                box_width = 0.2 / max(n_strat, 1)
-                for i, strategy in enumerate(strategies):
-                    # Filter summary for the current strategy
+                # Display summary as a table-like annotation
+                # Prepare table headers and rows
+                headers = ["Strategy", "Total ROI", "Win Rate", "Lump Sum ROI", "ROI Ratio", "Description"]
+                rows = []
+                for strategy in strategies:
                     strategy_summary = summary[summary["Strategy"] == strategy]
-                    # Prepare summary text
                     s = strategy_summary.iloc[0]
-                    box_text = (
-                        "Strategy: " + s['Strategy'] + "\n"
-                        f"Str. total ROI: {round(float(str(s['Total ROI']).replace('%',''))):.0f}%\n"
-                        f"Win Rate: {round(float(str(s['Win Rate']).replace('%',''))):.0f}%\n"
-                        f"Lump Sum ROI: {round(float(str(s['Lump Sum ROI']).replace('%',''))):.0f}%\n"
-                        f"Str ROI Ratio: {s['ROI Ratio (Strategy/Lump Sum)']}"
-                    )
-                    # Calculate x position for each box
-                    x_pos = 0.2 + i * (box_width + 0.05)
-                    ax2.text(
-                        x_pos, 0.98, box_text,
-                        transform=ax2.transAxes,
-                        fontsize=10,
-                        verticalalignment='top',
-                        horizontalalignment='left',
-                        bbox=dict(boxstyle="round,pad=0.5", fc="white", ec=str_colors[strategy], alpha=0.9)
-                    )
+                    row = [
+                        s['Strategy'],
+                        s['Total ROI'],
+                        s['Win Rate'],
+                        s['Lump Sum ROI'],
+                        s['ROI Ratio (Strategy/Lump Sum)'],
+                        s['Description'],
+                    ]
+                    rows.append(row)
+                # Build table string
+                col_widths = [max(len(str(cell)) for cell in [header] + [row[i] for row in rows]) for i, header in enumerate(headers)]
+                header_line = " | ".join(header.ljust(col_widths[i]) for i, header in enumerate(headers))
+                sep_line = "-+-".join('-' * col_widths[i] for i in range(len(headers)))
+                row_lines = [" | ".join(str(cell).ljust(col_widths[i]) for i, cell in enumerate(row)) for row in rows]
+                table_text = header_line + "\n" + sep_line + "\n" + "\n".join(row_lines)
+                # Place the table as a single annotation box
+                ax2.text(
+                    0.01, 0.98, table_text,
+                    transform=ax2.transAxes,
+                    fontsize=10,
+                    verticalalignment='top',
+                    horizontalalignment='left',
+                    family='monospace',
+                    bbox=dict(boxstyle="round,pad=0.5", fc="white", ec="#333333", alpha=0.95)
+                )
 
+
+        plt.figure(figsize=(14, 7))
+        plt.plot(self.df.index, self.df["Close"], label="Close Price", color="black")
         plt.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.7)
         plt.title(f"{self.ticker} {self.timeframe}")
         plt.xlabel("Date")
         plt.ylabel("Price")
-        #plt.legend()
 
+        ema_fast = self.df["EMA_fast"]
+        ema_slow = self.df["EMA_slow"]
+        ema_color = self.df["ema_color"]
+        x = mdates.date2num(self.df.index.to_pydatetime())
+
+        # Plot EMA_fast and EMA_slow with coloring by ema_color
+        _plot_colored_segments(x, ema_fast.values, ema_color, "EMA Fast")
+        _plot_colored_segments(x, ema_slow.values, ema_color, "EMA Slow")
+        # Fill between EMA_fast and EMA_slow with colors based on ema_color
+        _fill_between_emas(x, ema_fast.values, ema_slow.values, ema_color, fill_color_map)
+        
+        # Move signals to the front by plotting them last and setting zorder high
+        def _plot_signals_front(prefix="str_def_2"):
+            buy_offset = -0.05
+            sell_offset = 0.05
+
+            buy_signals = self.df[self.df["str_def_signal"] == 1]
+            sell_signals = self.df[self.df["str_def_signal"] == -1]
+
+            plt.scatter(
+                mdates.date2num(buy_signals.index),
+                buy_signals["Close"] * (1 + buy_offset),
+                marker="^",
+                color="green",
+                s=100,
+                label="Buy Signal",
+                zorder=10
+                )
+            plt.scatter(
+                mdates.date2num(sell_signals.index),
+                sell_signals["Close"] * (1 + sell_offset),
+                marker="v",
+                color="red",
+                s=100,
+                label="Sell Signal",
+                zorder=10
+                )
+            
+            if prefix == "str_def_2":
+                buy_signals = self.df[self.df[f"{prefix}_signal"] == 1]
+                sell_signals = self.df[self.df[f"{prefix}_signal"] == -1]
+
+                plt.scatter(
+                    mdates.date2num(buy_signals.index),
+                    buy_signals["Close"] * (1 + buy_offset),
+                    marker="^",
+                    color="green",
+                    s=50,
+                    alpha=0.5,
+                    label=f"{prefix} Buy Signal",
+                    zorder=10
+                )
+                plt.scatter(
+                    mdates.date2num(sell_signals.index),
+                    sell_signals["Close"] * (1 + sell_offset),
+                    marker="v",
+                    color="red",
+                    s=50,
+                    alpha=0.5,
+                    label=f"{prefix} Sell Signal",
+                    zorder=10
+                )
+        _plot_signals_front()
+
+        ax = plt.gca()
+        ax2 = ax.twinx()
+        ax2.set_ylabel("Initial capital + Profit & Loss")
+        # Set ax2 maximum to be about 25% higher than default
+        ymax = self.df[["str_lump_sum", "str_def_ret", "str_def_50pct_ret"]].max().max()
+        ax2.set_ylim(top=ymax * 1.4)
+        
         _plot_backtest_results()
 
+        # Combine legends from both axes
+        lines, labels = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines + lines2, labels + labels2, loc="center left", fontsize=10, framealpha=0.9)
+        
         plt.tight_layout()
 
         if self.save_img:
@@ -760,7 +841,7 @@ class Ploter:
 
 
 if __name__ == "__main__":
-    if True: # Fetch and save data for multiple tickers
+    if False: # Fetch and save data for multiple tickers
         asset_type = "stocks"
         ticker = None #'MIGA.BE','TL0.DE','MIGA.BE','1X00.BE','1NW.BE','NVD.DE','TT8.DE','1QZ.DE','M44.BE','SGM.BE']
         # asset_type = "crypto-USD"
@@ -774,8 +855,8 @@ if __name__ == "__main__":
             yfin.fetch_and_save_data()
 
     else: # Calculate, backtest and plot specific ticker
-        asset_type = 'equity' #'crypto-USD'
-        ticker = 'MIGA.BE' #'SOL-USD'
+        asset_type = 'stocks' #'crypto-USD'
+        ticker = 'NVD.BE' #'SOL-USD'
         timeframe = '1D'
 
         # Check if indicators file exists
@@ -795,7 +876,7 @@ if __name__ == "__main__":
             # Get trading signals
             df = calc.get_default_signals()
             # Append additional signals if needed
-            calc.append_additional_signals(df, prefix="str_def_2")
+            calc.get_additional_signals(df, prefix="str_def_2")
 
         if True: # Get backtest results
             period = ("2022-01-02", "2025-05-30")

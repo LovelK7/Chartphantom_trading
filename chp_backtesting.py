@@ -24,7 +24,9 @@ class YF:
         if type(tickers) is str:
             self.tickers = [tickers]
         else:
-            self.tickers = pd.read_csv(tickers_fpath).get("tickers", tickers).tolist()
+            tickers_df = pd.read_csv(tickers_fpath)
+            filtered = tickers_df[tickers_df["type"] == asset_type]
+            self.tickers = filtered.get("tickers", tickers).tolist()
 
     def search_query(self, query):
         """
@@ -223,7 +225,7 @@ class Calc:
         self.df = df
         return df
     
-    def get_additional_signals(self, df, prefix="str_def_2"):
+    def get_additional_signals(self, df, prefix="str_def_2", pct_threshold=0.02):
         """
         Append additional signals to the DataFrame.
         This method is a placeholder for future signal calculations.
@@ -246,9 +248,6 @@ class Calc:
 
         # Only detect crosses when ema_color is 'bull'
         bull_condition = df["ema_color"] == "bull"
-
-        # Set the percentage threshold (e.g., 1% = 0.01)
-        pct_threshold = 0.05  # Change this value as needed
 
         # Detect upward cross: previous Close <= previous EMA_fast and current Close > (1 + pct_threshold) * EMA_fast
         cross_up = (
@@ -578,7 +577,13 @@ class Backtest():
                 num_trades = np.nan
 
             # Calculate ratio of strategy ROI to lump sum ROI
-            roi_ratio = (total_return / lump_sum_roi) if lump_sum_roi != 0 and not np.isnan(lump_sum_roi) else np.nan
+            if total_return < 0 and lump_sum_roi < 0:
+                roi_ratio = np.nan
+            else:
+                if isinstance(lump_sum_roi, (int, float, np.floating)) and lump_sum_roi != 0 and not (isinstance(lump_sum_roi, float) and np.isnan(lump_sum_roi)):
+                    roi_ratio = total_return / lump_sum_roi
+                else:
+                    roi_ratio = np.nan
 
             metrics = {
                 "Ticker": self.ticker,
@@ -867,7 +872,7 @@ class Ploter:
         plt.tight_layout()
 
         if self.save_img:
-            img_path = os.path.join(figs_dir, f"{self.ticker}_{self.timeframe}_plot.png")
+            img_path = os.path.join(figs_dir, asset_type, f"{self.ticker}_{self.timeframe}_plot.png")
             plt.savefig(img_path, dpi=150, bbox_inches='tight')
             print(f"Plot saved to {img_path}")
         plt.show()
@@ -929,21 +934,20 @@ class Ploter:
 if __name__ == "__main__":
     if False: # Fetch and save data for multiple tickers
         asset_type = "stocks"
-        ticker = None #'MIGA.BE','TL0.DE','MIGA.BE','1X00.BE','1NW.BE','NVD.DE','TT8.DE','1QZ.DE','M44.BE','SGM.BE']
-        # asset_type = "crypto-USD"
-        # tickers = ['SUI20947-USD'] #["BTC-USD","SOL-USD"]
+        ticker = "ORC.DE" #'MIGA.BE','TL0.DE','MIGA.BE','1X00.BE','1NW.BE','NVD.DE','TT8.DE','1QZ.DE','M44.BE','SGM.BE']
+        #asset_type = "crypto"
+        #ticker = 'TAO22974-USD'
 
         yfin = YF(ticker, asset_type)
         if False: # Check if tickers are valid
-            query = 'PTX.BE'
-            yfin.search_query(query)
-        if True:
+            yfin.search_query(ticker)
+        else: # Fetch and save data
             yfin.fetch_and_save_data()
 
     else: # Calculate, backtest and plot specific ticker
-        asset_type = 'stocks' #'crypto-USD'
-        ticker = 'NVD.BE' #'SOL-USD'
-        timeframe = '1D'
+        asset_type = 'stocks' #'crypto'
+        ticker = 'ORC.DE' #'SOL-USD'
+        timeframe = '2D'
 
         # Check if indicators file exists
         overwrite = False
@@ -962,7 +966,8 @@ if __name__ == "__main__":
             # Get trading signals
             df = calc.get_default_signals()
             # Append additional signals if needed
-            calc.get_additional_signals(df, prefix="str_def_2")
+            pct_threshold = 0.02
+            calc.get_additional_signals(df, prefix="str_def_2", pct_threshold=pct_threshold)
 
         if True: # Get backtest results
             period = ("2022-01-02", "2025-05-30")

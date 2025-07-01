@@ -15,9 +15,9 @@ strategies_fpath = os.path.join(results_dir, "!strategies_performance_summary.cs
 tickers_fpath = os.path.join(data_dir, "tickers.csv")
 
 class YF:
-    def __init__(self, tickers=None, asset_type='stocks', start_date=None, end_date=None):
+    def __init__(self, tickers=None, filename='stocks', start_date=None, end_date=None):
         self.tickers = tickers
-        self.asset_data = os.path.join(data_dir, f"{asset_type}.csv")
+        self.asset_data = os.path.join(data_dir, f"{filename}.csv")
         self.start_date = start_date if start_date else datetime(2020, 6, 1)
         self.end_date = end_date if end_date else datetime.today()
         self.data = None
@@ -25,7 +25,7 @@ class YF:
             self.tickers = [tickers]
         else:
             tickers_df = pd.read_csv(tickers_fpath)
-            filtered = tickers_df[tickers_df["type"] == asset_type]
+            filtered = tickers_df[tickers_df["type"] == filename]
             self.tickers = filtered.get("tickers", tickers).tolist()
 
     def search_query(self, query):
@@ -64,7 +64,7 @@ class YF:
         print(f"Fetching data for tickers: {', '.join(self.tickers)}")
         if os.path.exists(self.asset_data):
             existing_data = pd.read_csv(self.asset_data, index_col="Date")
-            existing_data.index = pd.to_datetime(existing_data.index, format='%Y-%m-%d', errors='coerce')
+            existing_data.index = pd.to_datetime(existing_data.index, format='%d.%m.%Y', errors='coerce')
             existing_tickers = list({col.split('_')[0] for col in existing_data.columns if '_' in col})
         else:
             existing_data = pd.DataFrame()
@@ -78,14 +78,18 @@ class YF:
             if ticker not in existing_tickers:
                 print(f"Fetching data for {ticker}...")
                 df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)[["Low", "Open", "Close", "High"]].dropna()
-                df.columns = [f'{ticker}_Low', f'{ticker}_Open', f'{ticker}_Close', f'{ticker}_High']
+                if not df.empty:
+                    df.columns = [f'{ticker}_Low', f'{ticker}_Open', f'{ticker}_Close', f'{ticker}_High']
+                else:
+                    print(f"No data found for {ticker}. Skipping.")
+                    continue
                 if existing_data.empty:
                     existing_data = df
                 else:
                     existing_data = existing_data.join(df, how='outer')
                     existing_data.sort_index(inplace=True)
-                    existing_data.to_csv(self.asset_data)
-                    print(f"Data for {ticker} saved to {os.path.basename(self.asset_data)}.")
+                existing_data.to_csv(self.asset_data)
+                print(f"Data for {ticker} saved to {os.path.basename(self.asset_data)}.")
             else:
                 last_available_date = existing_data.index.max()
                 # Update df with missing dates from last_available_date+1 up to end
@@ -932,13 +936,14 @@ class Ploter:
 
 
 if __name__ == "__main__":
+
     if False: # Fetch and save data for multiple tickers
-        asset_type = "stocks"
-        ticker = "ORC.DE" #'MIGA.BE','TL0.DE','MIGA.BE','1X00.BE','1NW.BE','NVD.DE','TT8.DE','1QZ.DE','M44.BE','SGM.BE']
+        asset_fname = "stocks"
+        ticker = "MTE.DE" #'MIGA.BE','TL0.DE','MIGA.BE','1X00.BE','1NW.BE','NVD.DE','TT8.DE','1QZ.DE','M44.BE','SGM.BE']
         #asset_type = "crypto"
         #ticker = 'TAO22974-USD'
 
-        yfin = YF(ticker, asset_type)
+        yfin = YF(ticker, asset_fname)
         if False: # Check if tickers are valid
             yfin.search_query(ticker)
         else: # Fetch and save data
@@ -946,8 +951,8 @@ if __name__ == "__main__":
 
     else: # Calculate, backtest and plot specific ticker
         asset_type = 'stocks' #'crypto'
-        ticker = 'ORC.DE' #'SOL-USD'
-        timeframe = '2D'
+        ticker = '8CF.BE' #'SOL-USD'
+        timeframe = '1D'
 
         # Check if indicators file exists
         overwrite = False

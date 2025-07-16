@@ -64,7 +64,10 @@ class YF:
         print(f"Fetching data for tickers: {', '.join(self.tickers)}")
         if os.path.exists(self.asset_data):
             existing_data = pd.read_csv(self.asset_data, index_col="Date")
-            existing_data.index = pd.to_datetime(existing_data.index, format='%d.%m.%Y', errors='coerce')
+            try:
+                existing_data.index = pd.to_datetime(existing_data.index, format='%d.%m.%Y')
+            except ValueError: # Only for the first time, if the format is different
+                existing_data.index = pd.to_datetime(existing_data.index, format='%Y-%m-%d')
             existing_tickers = list({col.split('_')[0] for col in existing_data.columns if '_' in col})
         else:
             existing_data = pd.DataFrame()
@@ -108,26 +111,59 @@ class YF:
 
 
 class Calc:
-    def __init__(self, ticker, asset_type, timeframe='1D', results_csv=None):
+    def __init__(self, ticker, asset_type, timeframe='1D', results_csv=None, pair=False):
         self.ticker = ticker
         self.asset_data = os.path.join(data_dir, f"{asset_type}.csv")
         self.timeframe = timeframe
         self.results_csv = results_csv
+        self.pair = pair
 
     def get_ticker_data(self):
-        # Read CSV with Date as string, then convert index to datetime with format '%d.%m.%Y'
+        """
+        Load and return OHLC data for a ticker or a pair.
+        If self.pair is True, calculate the ratio of two tickers (e.g., 'SOL-BTC' = 'SOL-USD' / 'BTC-USD').
+        Otherwise, load single ticker data.
+        """
         existing_data = pd.read_csv(self.asset_data, index_col="Date")
-        existing_data.index = pd.to_datetime(existing_data.index, format='%Y-%m-%d', errors='coerce')
-        # Filter columns for the specified ticker
-        ticker_columns = [col for col in existing_data.columns if col.startswith(f"{self.ticker}_")]
-        if not ticker_columns:
-            print(f"No data found for ticker {self.ticker}")
-            exit()
-        df = existing_data[ticker_columns].copy()
-        df.columns = [col.split('_')[1] for col in ticker_columns]  # Rename columns to 'Open', 'Close', etc.
-        if df.empty:
-            print(f"No data found for ticker {self.ticker}")
-            exit()
+        try:
+            existing_data.index = pd.to_datetime(existing_data.index, format='%d.%m.%Y')
+        except ValueError: # Only for the first time, if the format is different
+            existing_data.index = pd.to_datetime(existing_data.index, format='%Y-%m-%d')
+
+        if self.pair:
+            # Handle pair data: e.g., 'SOL-BTC' = 'SOL-USD' / 'BTC-USD'
+            if '-' not in self.ticker:
+                print("Pair ticker must be in the format 'BASE-QUOTE', e.g., 'SOL-BTC'.")
+                exit()
+            base, quote = self.ticker.split('-')
+            base_ticker = f"{base}-USD"
+            quote_ticker = f"{quote}-USD"
+            base_cols = [col for col in existing_data.columns if col.startswith(f"{base_ticker}_")]
+            quote_cols = [col for col in existing_data.columns if col.startswith(f"{quote_ticker}_")]
+            if not base_cols or not quote_cols:
+                print(f"Missing data for base '{base_ticker}' or quote '{quote_ticker}' in {self.asset_data}")
+                exit()
+            base_df = existing_data[base_cols].copy()
+            base_df.columns = [col.replace(f"{base_ticker}_", "") for col in base_cols]
+            quote_df = existing_data[quote_cols].copy()
+            quote_df.columns = [col.replace(f"{quote_ticker}_", "") for col in quote_cols]
+            # Align indices
+            df = pd.DataFrame(index=base_df.index.union(quote_df.index))
+            for col in ["Open", "High", "Low", "Close"]:
+                if col in base_df.columns and col in quote_df.columns:
+                    df[col] = base_df[col] / quote_df[col]
+            df = df.dropna()
+        else:
+            # Handle single ticker data
+            ticker_columns = [col for col in existing_data.columns if col.startswith(f"{self.ticker}_")]
+            if not ticker_columns:
+                print(f"No data found for ticker {self.ticker}")
+                exit()
+            df = existing_data[ticker_columns].copy()
+            df.columns = [col.split('_')[1] for col in ticker_columns]
+            if df.empty:
+                print(f"No data found for ticker {self.ticker}")
+                exit()
 
         # Resample if timeframe is not '1D'
         if self.timeframe != '1D':
@@ -190,6 +226,9 @@ class Calc:
         df["neutral"] = ~(df["bull"] | df["bear"])
         df["ema_color"] = np.where(df["bull"], "bull", np.where(df["bear"], "bear", "neutral"))
 
+        # Calculate daily returns
+        df["daily_return"] = df["Close"].pct_change()
+
         # Save
         df.to_csv(self.results_csv, index=True)
         print(f"--- Indicators for {self.ticker} saved with {self.timeframe} timeframe.")
@@ -228,7 +267,7 @@ class Calc:
         print(f"--- Signals for {self.ticker} with {self.timeframe} timeframe saved.")
         self.df = df
         return df
-    
+
     def get_additional_signals(self, df, prefix="str_def_2", pct_threshold=0.02):
         """
         Append additional signals to the DataFrame.
@@ -535,6 +574,25 @@ class Backtest():
             "Backtest Period": f"{df.index[0].date()} to {df.index[-1].date()} ({years:.1f} years)" if years == years else "N/A"
         }
 
+    def _calculate_sharpe_sortino(self):
+        df = self.df
+        # Sharpe Ratio (annualized, risk-free rate assumed 0)
+        mean_return = df["daily_return"].mean()
+        std_return = df["daily_return"].std()
+        sharpe = (mean_return / std_return) * np.sqrt(252) if std_return != 0 else np.nan
+
+        # Sortino Ratio (annualized, downside risk)
+        downside = df["daily_return"].copy()
+        downside[downside > 0] = 0
+        downside_std = np.sqrt((downside ** 2).mean())
+        sortino = (mean_return / downside_std) * np.sqrt(252) if downside_std != 0 else np.nan
+
+        # Save Sharpe and Sortino ratios
+        self.sharpe_sortino_metrics = {
+            "Sharpe Ratio": sharpe,
+            "Sortino Ratio": sortino,
+        }
+
     def _calculate_strategy_metrics(self):
         df = self.df
         ret_cols = [col for col in df.columns if col.endswith('_ret')]
@@ -602,6 +660,8 @@ class Backtest():
                 "Lump Sum ROI": f"{lump_sum_roi * 100:.0f}%" if not np.isnan(lump_sum_roi) else "N/A",
                 "Lump Sum CAGR": f"{lump_sum_cagr * 100:.0f}%" if not np.isnan(lump_sum_cagr) else "N/A",
                 "ROI Ratio (Strategy/Lump Sum)": f"{roi_ratio:.2f}" if not np.isnan(roi_ratio) else "N/A",
+                "Sharpe Ratio": self.sharpe_sortino_metrics.get("Sharpe Ratio", np.nan),
+                "Sortino Ratio": self.sharpe_sortino_metrics.get("Sortino Ratio", np.nan),
                 "Description": description.get(strat, "N/A")
                 }
             summaries.append(metrics)
@@ -619,6 +679,8 @@ class Backtest():
             "Lump Sum ROI": "N/A",
             "Lump Sum CAGR": "N/A",
             "ROI Ratio (Strategy/Lump Sum)": "N/A",
+            "Sharpe Ratio": "N/A",
+            "Sortino Ratio": "N/A",
             "Description": "N/A",
         }])
 
@@ -629,6 +691,8 @@ class Backtest():
         else:
             self._simulate_lump_sum()
             self._calculate_lump_sum_metrics()
+        
+        self._calculate_sharpe_sortino()
 
         if "str_def_ret" in self.df.columns:
             print(f"-- Default strategy return column already exists for {self.ticker}. Skipping simulation.")
@@ -655,12 +719,18 @@ class Backtest():
 
 
 class Ploter:
-    def __init__(self, ticker, df, period=None, timeframe='1D', save_img=False):
+    def __init__(self, ticker, df, period=None, timeframe='1D', save_img=False, pair=False):
         self.ticker = ticker
         self.df = df
         self.period = period
         self.timeframe = timeframe
         self.save_img = save_img
+        if not pair:
+            self.img_subdir = os.path.join(figs_dir, asset_type)
+        else:
+            self.img_subdir = os.path.join(figs_dir, f"{asset_type}_pair")
+        if not os.path.exists(self.img_subdir):
+            os.makedirs(self.img_subdir)
 
         # If date_range is provided, filter the DataFrame
         if period is not None:
@@ -876,7 +946,7 @@ class Ploter:
         plt.tight_layout()
 
         if self.save_img:
-            img_path = os.path.join(figs_dir, asset_type, f"{self.ticker}_{self.timeframe}_plot.png")
+            img_path = os.path.join(self.img_subdir, f"{self.ticker}_{self.timeframe}_plot.png")
             plt.savefig(img_path, dpi=150, bbox_inches='tight')
             print(f"Plot saved to {img_path}")
         plt.show()
@@ -938,10 +1008,13 @@ class Ploter:
 if __name__ == "__main__":
 
     if False: # Fetch and save data for multiple tickers
-        asset_fname = "stocks"
-        ticker = "MTE.DE" #'MIGA.BE','TL0.DE','MIGA.BE','1X00.BE','1NW.BE','NVD.DE','TT8.DE','1QZ.DE','M44.BE','SGM.BE']
-        #asset_type = "crypto"
+        # asset_fname = "stocks"
+        # ticker = "MTE.DE" #'MIGA.BE','TL0.DE','MIGA.BE','1X00.BE','1NW.BE','NVD.DE','TT8.DE','1QZ.DE','M44.BE','SGM.BE']
+        asset_fname = "crypto"
+        #ticker = 'BTC-USD'
+        #ticker = 'SOL-USD'
         #ticker = 'TAO22974-USD'
+        ticker = 'SUI20947-USD'
 
         yfin = YF(ticker, asset_fname)
         if False: # Check if tickers are valid
@@ -950,12 +1023,16 @@ if __name__ == "__main__":
             yfin.fetch_and_save_data()
 
     else: # Calculate, backtest and plot specific ticker
-        asset_type = 'stocks' #'crypto'
-        ticker = '8CF.BE' #'SOL-USD'
-        timeframe = '1D'
+        asset_type = 'crypto'
+        #asset_type = 'stocks'
 
+        ticker = 'BTC-USD'
+        #ticker = '8CF.BE'
+        timeframe = '1D'
+        pair = False
+        
         # Check if indicators file exists
-        overwrite = False
+        overwrite = True
         results_csv = os.path.join(results_dir, f"{ticker}_{timeframe}_data_indicators_signals.csv")
         if not overwrite and os.path.exists(results_csv):
             print(f"--- Indicators and signals for {ticker} already exist. Skipping calculation.")
@@ -963,7 +1040,7 @@ if __name__ == "__main__":
             df.index = pd.to_datetime(df.index, format='%Y-%m-%d', errors='coerce')
         else:
             print(f"--- Calculating indicators and signals for {ticker} with {timeframe} timeframe.")
-            calc = Calc(ticker, asset_type, timeframe, results_csv)
+            calc = Calc(ticker, asset_type, timeframe, results_csv, pair)
             # Load ticker data
             df = calc.get_ticker_data()
             # Compute indicator values
@@ -975,11 +1052,11 @@ if __name__ == "__main__":
             calc.get_additional_signals(df, prefix="str_def_2", pct_threshold=pct_threshold)
 
         if True: # Get backtest results
-            period = ("2022-01-02", "2025-05-30")
+            period = ("2022-01-02", "2025-06-30")
             bt = Backtest(ticker, df, period, timeframe, results_csv)
             df = bt.run_backtest()
 
         if True: # Plot results
-            date_range = ("2022-01-02", "2025-05-30")
-            ploter = Ploter(ticker, df, date_range, timeframe, save_img=True)
+            date_range = ("2022-01-02", "2025-06-30")
+            ploter = Ploter(ticker, df, date_range, timeframe, save_img=True, pair=pair)
             ploter.plot_plt()

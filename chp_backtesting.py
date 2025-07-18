@@ -15,9 +15,9 @@ strategies_fpath = os.path.join(results_dir, "!strategies_performance_summary.cs
 tickers_fpath = os.path.join(data_dir, "tickers.csv")
 
 class YF:
-    def __init__(self, tickers=None, filename='stocks', start_date=None, end_date=None):
+    def __init__(self, tickers=None, equity_type='stocks', start_date=None, end_date=None):
         self.tickers = tickers
-        self.asset_data = os.path.join(data_dir, f"{filename}.csv")
+        self.asset_data = os.path.join(data_dir, f"{equity_type}.csv")
         self.start_date = start_date if start_date else datetime(2020, 6, 1)
         self.end_date = end_date if end_date else datetime.today()
         self.data = None
@@ -25,7 +25,7 @@ class YF:
             self.tickers = [tickers]
         else:
             tickers_df = pd.read_csv(tickers_fpath)
-            filtered = tickers_df[tickers_df["type"] == filename]
+            filtered = tickers_df[tickers_df["type"] == equity_type]
             self.tickers = filtered.get("tickers", tickers).tolist()
 
     def search_query(self, query):
@@ -1026,10 +1026,10 @@ if __name__ == "__main__":
         asset_type = 'crypto'
         #asset_type = 'stocks'
 
-        ticker = 'BTC-USD'
+        ticker = 'SOL-BTC'
         #ticker = '8CF.BE'
         timeframe = '1D'
-        pair = False
+        pair = True
         
         # Check if indicators file exists
         overwrite = True
